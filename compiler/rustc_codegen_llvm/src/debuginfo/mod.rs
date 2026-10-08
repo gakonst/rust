@@ -170,9 +170,23 @@ impl<'ll, 'tcx> DebugInfoBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
 
         let template_parameters = get_template_parameters(self, generics, args);
 
-        let linkage_name = &mangled_name_of_instance(self, instance).name;
+        // With line-tables-only debuginfo, LLVM only builds minimal subprogram DIEs (no
+        // `DW_AT_linkage_name`), and with DWARF <= 4 on non-Apple DWARF targets we disable the
+        // name tables (see `build_compile_unit_di_node`), so the linkage name can't end up in
+        // the object file. In that case, like clang with `-gline-tables-only`, don't compute it
+        // unless it may be used to match functions against a sample profile. This avoids
+        // mangling the symbol names of all functions inlined into MIR (they are not mono items,
+        // so their symbol names would not be computed otherwise).
+        let sess = self.sess();
+        let emit_linkage_name = sess.opts.debuginfo != DebugInfo::LineTablesOnly
+            || sess.target.debuginfo_kind != DebuginfoKind::Dwarf
+            || sess.dwarf_version() > 4
+            || sess.opts.cg.profile_sample_use.is_some()
+            || sess.opts.unstable_opts.debuginfo_for_profiling;
+        let linkage_name =
+            if emit_linkage_name { mangled_name_of_instance(self, instance).name } else { "" };
         // Omit the linkage_name if it is the same as subprogram name.
-        let linkage_name = if &name == linkage_name { "" } else { linkage_name };
+        let linkage_name = if name == linkage_name { "" } else { linkage_name };
 
         // FIXME(eddyb) does this need to be separate from `loc.line` for some reason?
         let scope_line = loc.line;
