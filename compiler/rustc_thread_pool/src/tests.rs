@@ -195,3 +195,26 @@ fn cleared_current_thread() -> Result<(), ThreadPoolBuildError> {
 
     Ok(())
 }
+
+#[test]
+#[cfg_attr(any(target_os = "emscripten", target_family = "wasm"), ignore)]
+fn yield_callback_called_between_jobs() {
+    let yields = Arc::new(AtomicUsize::new(0));
+    let y = Arc::clone(&yields);
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(2)
+        .yield_thread_handler(move || {
+            y.fetch_add(1, Ordering::SeqCst);
+        })
+        .build()
+        .unwrap();
+    // Jobs taking longer than the yield interval, so that busy workers invoke the handler.
+    pool.install(|| {
+        crate::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|_| std::thread::sleep(std::time::Duration::from_millis(25)));
+            }
+        })
+    });
+    assert!(yields.load(Ordering::SeqCst) > 0);
+}
