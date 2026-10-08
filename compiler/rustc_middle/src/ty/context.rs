@@ -307,6 +307,68 @@ const NUM_PREINTERNED_RE_VARS: u32 = 500;
 const NUM_PREINTERNED_ANON_RE_BOUNDS_I: u32 = 3;
 const NUM_PREINTERNED_ANON_RE_BOUNDS_V: u32 = 20;
 
+/// Bits of the first (smallest) bucket of a [`DenseInternMemo`].
+const DENSE_MEMO_FIRST_BUCKET_BITS: u32 = 10;
+/// Number of buckets of a [`DenseInternMemo`]; indices `>= 2^(FIRST_BITS + BUCKETS - 1)` (4M) are
+/// not memoized.
+const DENSE_MEMO_BUCKETS: usize = 13;
+
+/// A lock-free, lazily grown memo of already interned values that are keyed by a dense index,
+/// such as `ReVar(n)` or canonical bound variables with `n` beyond the fixed-size pre-interned
+/// tables above. Big trait-solver responses and inference contexts routinely use thousands of
+/// such variables, and re-interning them means hashing and probing the (huge, cache-missing)
+/// interner tables over and over again.
+///
+/// Slots are only ever filled with the value returned by the regular interner for that index,
+/// so a hit returns exactly the pointer that interning would have returned. Racing writers store
+/// the same pointer, which is harmless.
+pub struct DenseInternMemo<'tcx, T> {
+    buckets: [OnceLock<Box<[std::sync::atomic::AtomicPtr<T>]>>; DENSE_MEMO_BUCKETS],
+    _marker: std::marker::PhantomData<&'tcx T>,
+}
+
+impl<'tcx, T> DenseInternMemo<'tcx, T> {
+    fn new() -> Self {
+        DenseInternMemo {
+            buckets: std::array::from_fn(|_| OnceLock::new()),
+            _marker: Default::default(),
+        }
+    }
+
+    /// Bucket `0` holds indices `[0, 2^F)`, bucket `b >= 1` holds `[2^(F+b-1), 2^(F+b))`.
+    #[inline]
+    fn slot(idx: usize) -> Option<(usize, usize, usize)> {
+        const F: u32 = DENSE_MEMO_FIRST_BUCKET_BITS;
+        if idx < (1 << F) {
+            return Some((0, idx, 1 << F));
+        }
+        let log = usize::BITS - 1 - idx.leading_zeros();
+        let bucket = (log - F + 1) as usize;
+        if bucket >= DENSE_MEMO_BUCKETS {
+            return None;
+        }
+        Some((bucket, idx - (1 << log), 1 << log))
+    }
+
+    #[inline]
+    pub fn get_or_intern(&self, idx: usize, intern: impl FnOnce() -> &'tcx T) -> &'tcx T {
+        use std::sync::atomic::{AtomicPtr, Ordering};
+        let Some((bucket, offset, len)) = Self::slot(idx) else { return intern() };
+        let slots = self.buckets[bucket]
+            .get_or_init(|| (0..len).map(|_| AtomicPtr::new(std::ptr::null_mut())).collect());
+        let slot = &slots[offset];
+        let ptr = slot.load(Ordering::Acquire);
+        if !ptr.is_null() {
+            // SAFETY: non-null slots only ever contain `&'tcx T` references obtained from
+            // the interner below, which are valid for `'tcx`.
+            return unsafe { &*ptr };
+        }
+        let value = intern();
+        slot.store(value as *const T as *mut T, Ordering::Release);
+        value
+    }
+}
+
 pub struct CommonTypes<'tcx> {
     pub unit: Ty<'tcx>,
     pub bool: Ty<'tcx>,
@@ -380,6 +442,12 @@ pub struct CommonTypes<'tcx> {
     // `Bound(BoundVarIndexKind::Canonical, BoundTy { var: v, kind: BoundTyKind::Anon })`
     // for small values of `v`.
     pub anon_canonical_bound_tys: Vec<Ty<'tcx>>,
+
+    /// Memo of interned `Infer(ty::TyVar(n))` for larger values of `n`.
+    pub ty_vars_memo: DenseInternMemo<'tcx, WithCachedTypeInfo<TyKind<'tcx>>>,
+
+    /// Memo of interned anonymous canonical bound types for larger values of `v`.
+    pub anon_canonical_bound_tys_memo: DenseInternMemo<'tcx, WithCachedTypeInfo<TyKind<'tcx>>>,
 }
 
 pub struct CommonLifetimes<'tcx> {
@@ -401,6 +469,12 @@ pub struct CommonLifetimes<'tcx> {
     // `ReBound(BoundVarIndexKind::Canonical, BoundRegion { var: v, kind: BoundRegionKind::Anon })`
     // for small values of `v`.
     pub anon_re_canonical_bounds: Vec<Region<'tcx>>,
+
+    /// Memo of interned `ReVar(n)` for larger values of `n`.
+    pub re_vars_memo: DenseInternMemo<'tcx, RegionKind<'tcx>>,
+
+    /// Memo of interned anonymous canonical bound regions for larger values of `v`.
+    pub anon_re_canonical_bounds_memo: DenseInternMemo<'tcx, RegionKind<'tcx>>,
 }
 
 pub struct CommonConsts<'tcx> {
@@ -478,6 +552,8 @@ impl<'tcx> CommonTypes<'tcx> {
             fresh_float_tys,
             anon_bound_tys,
             anon_canonical_bound_tys,
+            ty_vars_memo: DenseInternMemo::new(),
+            anon_canonical_bound_tys_memo: DenseInternMemo::new(),
         }
     }
 }
@@ -524,6 +600,8 @@ impl<'tcx> CommonLifetimes<'tcx> {
             re_vars,
             anon_re_bounds,
             anon_re_canonical_bounds,
+            re_vars_memo: DenseInternMemo::new(),
+            anon_re_canonical_bounds_memo: DenseInternMemo::new(),
         }
     }
 }

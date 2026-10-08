@@ -9,6 +9,7 @@ use std::ops::{ControlFlow, Range};
 use hir::def::{CtorKind, DefKind};
 use rustc_abi::{FIRST_VARIANT, FieldIdx, NumScalableVectors, ScalableElt, VariantIdx};
 use rustc_attr_ir::lang_items::LangItem;
+use rustc_data_structures::intern::Interned;
 use rustc_errors::{ErrorGuaranteed, MultiSpan};
 use rustc_hir as hir;
 use rustc_hir::def_id::DefId;
@@ -377,11 +378,15 @@ impl<'tcx> Ty<'tcx> {
     #[inline]
     pub fn new_var(tcx: TyCtxt<'tcx>, v: ty::TyVid) -> Ty<'tcx> {
         // Use a pre-interned one when possible.
-        tcx.types
-            .ty_vars
-            .get(v.as_usize())
-            .copied()
-            .unwrap_or_else(|| Ty::new(tcx, Infer(TyVar(v))))
+        if let Some(ty) = tcx.types.ty_vars.get(v.as_usize()).copied() {
+            ty
+        } else {
+            Ty(Interned::new_unchecked(
+                tcx.types
+                    .ty_vars_memo
+                    .get_or_intern(v.as_usize(), || Ty::new(tcx, Infer(TyVar(v))).0.0),
+            ))
+        }
     }
 
     #[inline]
@@ -452,13 +457,20 @@ impl<'tcx> Ty<'tcx> {
         if let Some(ty) = tcx.types.anon_canonical_bound_tys.get(var.as_usize()).copied() {
             ty
         } else {
-            Ty::new(
-                tcx,
-                Bound(
-                    ty::BoundVarIndexKind::Canonical,
-                    ty::BoundTy { var, kind: ty::BoundTyKind::Anon },
-                ),
-            )
+            Ty(Interned::new_unchecked(tcx.types.anon_canonical_bound_tys_memo.get_or_intern(
+                var.as_usize(),
+                || {
+                    Ty::new(
+                        tcx,
+                        Bound(
+                            ty::BoundVarIndexKind::Canonical,
+                            ty::BoundTy { var, kind: ty::BoundTyKind::Anon },
+                        ),
+                    )
+                    .0
+                    .0
+                },
+            )))
         }
     }
 

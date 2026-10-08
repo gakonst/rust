@@ -701,11 +701,15 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
 
     fn intern_re_var(self, rv: RegionVid) -> Region<'tcx> {
         // Use a pre-interned one when possible.
-        self.lifetimes
-            .re_vars
-            .get(rv.as_usize())
-            .copied()
-            .unwrap_or_else(|| self.intern_region(ty::ReVar(rv)))
+        if let Some(re) = self.lifetimes.re_vars.get(rv.as_usize()).copied() {
+            re
+        } else {
+            Region(Interned::new_unchecked(
+                self.lifetimes
+                    .re_vars_memo
+                    .get_or_intern(rv.as_usize(), || self.intern_region(ty::ReVar(rv)).0.0),
+            ))
+        }
     }
 
     fn intern_region(self, region_kind: RegionKind<'tcx>) -> Region<'tcx> {
@@ -733,9 +737,15 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
         if let Some(re) = self.lifetimes.anon_re_canonical_bounds.get(var.as_usize()).copied() {
             re
         } else {
-            self.intern_region(ty::ReBound(
-                ty::BoundVarIndexKind::Canonical,
-                BoundRegion { var, kind: ty::BoundRegionKind::Anon },
+            Region(Interned::new_unchecked(
+                self.lifetimes.anon_re_canonical_bounds_memo.get_or_intern(var.as_usize(), || {
+                    self.intern_region(ty::ReBound(
+                        ty::BoundVarIndexKind::Canonical,
+                        BoundRegion { var, kind: ty::BoundRegionKind::Anon },
+                    ))
+                    .0
+                    .0
+                }),
             ))
         }
     }
