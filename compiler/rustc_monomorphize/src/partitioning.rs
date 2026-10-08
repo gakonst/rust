@@ -99,7 +99,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use rustc_attr_ir::lang_items::LangItem;
-use rustc_attr_ir::{InlineAttr, Linkage};
+use rustc_attr_ir::{InlineAttr, Linkage, find_attr};
 use rustc_data_structures::either::Either;
 use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
 use rustc_data_structures::sync::par_join;
@@ -404,7 +404,7 @@ fn merge_codegen_units<'tcx>(
         }
         None if cross_crate_lto
             && !cx.tcx.is_compiler_builtins(LOCAL_CRATE)
-            && !cx.tcx.is_no_builtins(LOCAL_CRATE) =>
+            && !find_attr!(cx.tcx, crate, NoBuiltins) =>
         {
             Some(NON_INCR_MIN_CGU_SIZE)
         }
