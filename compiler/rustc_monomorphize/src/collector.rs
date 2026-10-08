@@ -211,7 +211,7 @@ use std::ops::ControlFlow;
 use rustc_attr_ir::InlineAttr;
 use rustc_attr_ir::lang_items::LangItem;
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
-use rustc_data_structures::sync::{Lock, is_dyn_thread_safe, par_for_each_in};
+use rustc_data_structures::sync::{Lock, is_dyn_thread_safe, par_work_queue};
 use rustc_data_structures::unord::{UnordMap, UnordSet};
 use rustc_hir as hir;
 use rustc_hir::def::DefKind;
@@ -352,10 +352,6 @@ impl<'tcx> Extend<Spanned<MonoItem<'tcx>>> for MonoItems<'tcx> {
     }
 }
 
-/// Up to which depth of the mono item graph walk [`collect_items_rec`] visits the items used by an
-/// item in parallel (with the parallel frontend).
-const PAR_COLLECT_MAX_DEPTH: usize = 32;
-
 fn collect_items_root<'tcx>(
     tcx: TyCtxt<'tcx>,
     starting_item: Spanned<MonoItem<'tcx>>,
@@ -374,8 +370,62 @@ fn collect_items_root<'tcx>(
         &mut recursion_depths,
         recursion_limit,
         CollectionMode::UsedItems,
-        0,
     );
+}
+
+/// A pending step of the parallel mono item graph walk: an item, how it is collected, and the
+/// recursion depths along the path that led to it.
+struct WalkItem<'tcx> {
+    item: Spanned<MonoItem<'tcx>>,
+    mode: CollectionMode,
+    recursion_depths: DefIdMap<usize>,
+}
+
+/// Collect all monomorphized items reachable from `roots` with the parallel frontend.
+///
+/// Every discovered item is a separate task of a work queue (see [`par_work_queue`]) instead of a
+/// recursive call, so the walk spreads over all threads however deep and narrow the mono item
+/// graph is (async state machines form long chains), without nested blocking waits on a stack.
+/// Each item carries a copy of the recursion depths of its path, exactly like the recursive walk.
+/// Which thread visits an item first does not affect the collected items (the result is sorted).
+fn collect_items_parallel<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    roots: Vec<MonoItem<'tcx>>,
+    state: &SharedState<'tcx>,
+    recursion_limit: Limit,
+) {
+    let roots: Vec<_> = {
+        let mut visited = state.visited.lock();
+        roots
+            .into_iter()
+            .filter(|&root| visited.insert(root))
+            .map(|root| WalkItem {
+                item: dummy_spanned(root),
+                mode: CollectionMode::UsedItems,
+                recursion_depths: DefIdMap::default(),
+            })
+            .collect()
+    };
+    par_work_queue(roots, |walk_item: WalkItem<'tcx>, next: &mut Vec<WalkItem<'tcx>>| {
+        let WalkItem { item, mode, mut recursion_depths } = walk_item;
+        let (used_items, mentioned_items, _) =
+            collect_items_step(tcx, item, state, &mut recursion_depths, recursion_limit, mode);
+        // Used items first, then mentioned items, as in the recursive walk.
+        for used_item in used_items {
+            next.push(WalkItem {
+                item: used_item,
+                mode: CollectionMode::UsedItems,
+                recursion_depths: recursion_depths.clone(),
+            });
+        }
+        for mentioned_item in mentioned_items {
+            next.push(WalkItem {
+                item: mentioned_item,
+                mode: CollectionMode::MentionedItems,
+                recursion_depths: recursion_depths.clone(),
+            });
+        }
+    });
 }
 
 /// Collect all monomorphized items reachable from `starting_point`, and emit a note diagnostic if a
@@ -391,8 +441,51 @@ fn collect_items_rec<'tcx>(
     recursion_depths: &mut DefIdMap<usize>,
     recursion_limit: Limit,
     mode: CollectionMode,
-    depth: usize,
 ) {
+    let (used_items, mentioned_items, recursion_depth_reset) =
+        collect_items_step(tcx, starting_item, state, recursion_depths, recursion_limit, mode);
+
+    for used_item in used_items {
+        collect_items_rec(
+            tcx,
+            used_item,
+            state,
+            recursion_depths,
+            recursion_limit,
+            CollectionMode::UsedItems,
+        );
+    }
+
+    // Walk over mentioned items *after* used items, so that if an item is both mentioned and used then
+    // the loop above has fully collected it, so this loop will skip it.
+    for mentioned_item in mentioned_items {
+        collect_items_rec(
+            tcx,
+            mentioned_item,
+            state,
+            recursion_depths,
+            recursion_limit,
+            CollectionMode::MentionedItems,
+        );
+    }
+
+    if let Some((def_id, depth)) = recursion_depth_reset {
+        recursion_depths.insert(def_id, depth);
+    }
+}
+
+/// One step of the mono item graph walk: collects the items used and mentioned by
+/// `starting_item` (emitting a note diagnostic if a post-monomorphization error is encountered),
+/// and returns those not yet visited (resp. mentioned), plus the recursion depth to restore once
+/// they have been walked.
+fn collect_items_step<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    starting_item: Spanned<MonoItem<'tcx>>,
+    state: &SharedState<'tcx>,
+    recursion_depths: &mut DefIdMap<usize>,
+    recursion_limit: Limit,
+    mode: CollectionMode,
+) -> (MonoItems<'tcx>, MonoItems<'tcx>, Option<(DefId, usize)>) {
     let mut used_items = MonoItems::new();
     let mut mentioned_items = MonoItems::new();
     let recursion_depth_reset;
@@ -598,58 +691,9 @@ fn collect_items_rec<'tcx>(
     }
     if mode == CollectionMode::MentionedItems {
         assert!(used_items.is_empty(), "'mentioned' collection should never encounter used items");
-    } else if depth < PAR_COLLECT_MAX_DEPTH && used_items.items.len() > 1 && is_dyn_thread_safe() {
-        // With the parallel frontend, walk the newly discovered items in parallel. Collection
-        // starts from the roots in parallel already, but the bulk of a crate's mono items is often
-        // reachable from just a few roots, which would otherwise be walked by a single thread.
-        // Each walk gets its own copy of the recursion depths of the current path. Which thread
-        // visits an item first does not affect the collected items (the result is sorted).
-        // Parallelism is only introduced near the top of the walk to bound the extra stack usage
-        // of nested work-stealing waits.
-        let recursion_depths = &*recursion_depths;
-        par_for_each_in(used_items, |used_item| {
-            let mut recursion_depths = recursion_depths.clone();
-            collect_items_rec(
-                tcx,
-                *used_item,
-                state,
-                &mut recursion_depths,
-                recursion_limit,
-                CollectionMode::UsedItems,
-                depth + 1,
-            );
-        });
-    } else {
-        for used_item in used_items {
-            collect_items_rec(
-                tcx,
-                used_item,
-                state,
-                recursion_depths,
-                recursion_limit,
-                CollectionMode::UsedItems,
-                depth + 1,
-            );
-        }
     }
 
-    // Walk over mentioned items *after* used items, so that if an item is both mentioned and used then
-    // the loop above has fully collected it, so this loop will skip it.
-    for mentioned_item in mentioned_items {
-        collect_items_rec(
-            tcx,
-            mentioned_item,
-            state,
-            recursion_depths,
-            recursion_limit,
-            CollectionMode::MentionedItems,
-            depth + 1,
-        );
-    }
-
-    if let Some((def_id, depth)) = recursion_depth_reset {
-        recursion_depths.insert(def_id, depth);
-    }
+    (used_items, mentioned_items, recursion_depth_reset)
 }
 
 // Check whether we can normalize every type in the instantiated MIR body.
@@ -1974,9 +2018,13 @@ pub(crate) fn collect_crate_mono_items<'tcx>(
     let recursion_limit = tcx.recursion_limit();
 
     tcx.sess.time("monomorphization_collector_graph_walk", || {
-        par_for_each_in(roots, |root| {
-            collect_items_root(tcx, dummy_spanned(*root), &state, recursion_limit);
-        });
+        if is_dyn_thread_safe() {
+            collect_items_parallel(tcx, roots, &state, recursion_limit);
+        } else {
+            for root in roots {
+                collect_items_root(tcx, dummy_spanned(root), &state, recursion_limit);
+            }
+        }
     });
 
     // The set of MonoItems was created in an inherently indeterministic order because

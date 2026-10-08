@@ -39,7 +39,7 @@ pub use self::mode::{
 };
 pub use self::parallel::{
     broadcast, par_fns, par_for_each_in, par_for_each_in_order, par_for_each_slice, par_join,
-    par_map, parallel_guard, spawn, try_par_for_each_in,
+    par_map, par_work_queue, parallel_guard, spawn, try_par_for_each_in,
 };
 pub use self::vec::{AppendOnlyIndexVec, AppendOnlyVec};
 pub use self::worker_local::{Registry, WorkerLocal};
