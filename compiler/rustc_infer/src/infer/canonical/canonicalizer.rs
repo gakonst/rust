@@ -115,6 +115,39 @@ impl<'tcx> InferCtxt<'tcx> {
         )
     }
 
+    /// Like [`Self::canonicalize_response`], but the canonical result also keeps the given
+    /// universes, as if the value still mentioned placeholders or region variables in each of
+    /// them: the result has the same universe numbering and `max_universe` as when
+    /// canonicalizing the value before such regions were removed from it.
+    pub fn canonicalize_response_preserving_universes<V>(
+        &self,
+        value: V,
+        universes: &[ty::UniverseIndex],
+    ) -> Canonical<'tcx, V>
+    where
+        V: TypeFoldable<TyCtxt<'tcx>>,
+    {
+        let mut query_state = OriginalQueryValues::default();
+        for &universe in universes {
+            if universe != ty::UniverseIndex::ROOT {
+                if let Err(idx) = query_state.universe_map.binary_search(&universe) {
+                    query_state.universe_map.insert(idx, universe);
+                }
+            }
+        }
+        let mut canonical = Canonicalizer::canonicalize(
+            value,
+            Some(self),
+            self.tcx,
+            &CanonicalizeQueryResponse,
+            &mut query_state,
+        );
+        canonical.max_universe = canonical
+            .max_universe
+            .max(ty::UniverseIndex::from_usize(query_state.universe_map.len() - 1));
+        canonical
+    }
+
     pub fn canonicalize_user_type_annotation<V>(&self, value: V) -> Canonical<'tcx, V>
     where
         V: TypeFoldable<TyCtxt<'tcx>>,

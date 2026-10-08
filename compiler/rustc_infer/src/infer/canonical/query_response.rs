@@ -17,6 +17,7 @@ use rustc_middle::ty::{
     self, BoundVar, GenericArg, GenericArgKind, Ty, TyCtxt, TypeFoldable, TypeVisitableExt,
 };
 use rustc_span::bug;
+use smallvec::SmallVec;
 use tracing::{debug, instrument};
 
 use crate::infer::canonical::instantiate::{CanonicalExt, instantiate_value};
@@ -101,10 +102,20 @@ impl<'tcx> InferCtxt<'tcx> {
         T: Debug + TypeFoldable<TyCtxt<'tcx>>,
         Canonical<'tcx, QueryResponse<'tcx, T>>: ArenaAllocatable<'tcx>,
     {
-        let query_response =
-            self.make_query_response(inference_vars, answer, fulfill_cx, split_type_outlives)?;
+        let mut dropped_universes = SmallVec::new();
+        let query_response = self.make_query_response(
+            inference_vars,
+            answer,
+            fulfill_cx,
+            split_type_outlives,
+            &mut dropped_universes,
+        )?;
         debug!("query_response = {:#?}", query_response);
-        let canonical_result = self.canonicalize_response(query_response);
+        let canonical_result = if dropped_universes.is_empty() {
+            self.canonicalize_response(query_response)
+        } else {
+            self.canonicalize_response_preserving_universes(query_response, &dropped_universes)
+        };
         debug!("canonical_result = {:#?}", canonical_result);
 
         Ok(self.tcx.arena.alloc(canonical_result))
@@ -164,6 +175,7 @@ impl<'tcx> InferCtxt<'tcx> {
         answer: T,
         fulfill_cx: &mut dyn TraitEngine<'tcx, ScrubbedTraitError<'tcx>>,
         split_type_outlives: bool,
+        dropped_universes: &mut SmallVec<[ty::UniverseIndex; 4]>,
     ) -> Result<QueryResponse<'tcx, T>, NoSolution>
     where
         T: Debug + TypeFoldable<TyCtxt<'tcx>>,
@@ -196,6 +208,10 @@ impl<'tcx> InferCtxt<'tcx> {
         if split_type_outlives {
             region_constraints.constraints =
                 self.split_type_outlives_constraints(region_constraints.constraints);
+            self.remove_trivial_placeholder_region_constraints(
+                &mut region_constraints,
+                dropped_universes,
+            );
         }
         debug!(?region_constraints);
 
@@ -214,6 +230,57 @@ impl<'tcx> InferCtxt<'tcx> {
             value: answer,
             opaque_types,
         })
+    }
+
+    /// Drops region constraints which are trivially true and do not mention region inference
+    /// variables, i.e. `'r: 'r` and `'r == 'r` where `'r` (after shallow resolution, exactly as
+    /// the canonicalizer resolves it) is a placeholder or a free region. Only used for the
+    /// borrowck type op responses, whose consumer (`ConstraintConversion`) ignores such
+    /// constraints anyway.
+    ///
+    /// With the next trait solver, higher-ranked where-clauses produce very many
+    /// `'!a: '!a` constraints, each with a fresh placeholder that would otherwise become a
+    /// canonical variable of the cached response. The universes of the dropped placeholders
+    /// are pushed to `dropped_universes`, so that the canonical response keeps exactly the
+    /// same universes (borrowck maps placeholder errors back to the type op by universe), and
+    /// constraints on region variables are kept, so that instantiating the response creates
+    /// the same NLL region variables as before.
+    fn remove_trivial_placeholder_region_constraints(
+        &self,
+        region_constraints: &mut QueryRegionConstraints<'tcx>,
+        dropped_universes: &mut SmallVec<[ty::UniverseIndex; 4]>,
+    ) {
+        if region_constraints.constraints.is_empty() {
+            return;
+        }
+        let tcx = self.tcx;
+        let mut inner = self.inner.borrow_mut();
+        let mut rc = inner.unwrap_region_constraints();
+        let mut resolve = |r: ty::Region<'tcx>| match r.kind() {
+            ty::ReVar(vid) => rc.shallow_resolve_region_var(tcx, vid),
+            _ => r,
+        };
+        let mut trivial = |r1: ty::Region<'tcx>, r2: ty::Region<'tcx>| {
+            let (r1, r2) = (resolve(r1), resolve(r2));
+            if r1 != r2 {
+                return false;
+            }
+            match r1.kind() {
+                ty::RePlaceholder(placeholder) => {
+                    dropped_universes.push(placeholder.universe);
+                    true
+                }
+                ty::ReStatic | ty::ReEarlyParam(..) | ty::ReLateParam(_) => true,
+                _ => false,
+            }
+        };
+        region_constraints.constraints.retain(|c| match c.constraint {
+            ty::RegionConstraint::Outlives(outlives) => match outlives.0.kind() {
+                GenericArgKind::Lifetime(r1) => !trivial(r1, outlives.1),
+                GenericArgKind::Type(_) | GenericArgKind::Const(_) => true,
+            },
+            ty::RegionConstraint::Eq(eq) => !trivial(eq.0, eq.1),
+        });
     }
 
     /// Replaces each `T: 'r` constraint by the constraints `ConstraintConversion` would derive
