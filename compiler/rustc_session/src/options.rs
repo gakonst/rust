@@ -2676,7 +2676,8 @@ options! {
         "the directory metrics emitted by rustc are dumped into (implicitly enables default set of metrics)"),
     min_cgu_size: Option<usize> = (None, parse_opt_number, [TRACKED],
         "in non-incremental builds, merge codegen units smaller than this size estimate even \
-        when the number of codegen units was given explicitly (default: only for a default count)"),
+        when the number of codegen units was given explicitly; 0 disables merging (default: 1800 \
+        for a default count or when compiling for cross-crate LTO, otherwise no merging)"),
     min_function_alignment: Option<Align> = (None, parse_align, [TRACKED],
         "align all functions to at least this many bytes. Must be a power of 2"),
     min_recursion_limit: Option<usize> = (None, parse_opt_number, [TRACKED],
@@ -2936,6 +2937,10 @@ written to standard error output)"),
     #[rustc_lint_opt_deny_field_access("use `Session::lto` instead of this field")]
     thinlto: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "enable ThinLTO when possible"),
+    thinlto_internalize: Option<bool> = (None, parse_opt_bool, [TRACKED],
+        "for crate-graph ThinLTO (`-Clto=thin`), internalize every symbol that is neither \
+        exported from the final artifact nor referenced from another module, like fat LTO \
+        does (default: no)"),
     threads: Option<String> = (None, parse_opt_string, [UNTRACKED],
         "use `--jobs-frontend` instead"),
     time_llvm_passes: bool = (false, parse_bool, [UNTRACKED],
