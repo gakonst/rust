@@ -2,8 +2,8 @@ use std::fmt::Debug;
 use std::rc::Rc;
 
 use rustc_data_structures::fx::{FxHashSet, FxIndexSet};
-use rustc_index::Idx;
-use rustc_index::bit_set::SparseBitMatrix;
+use rustc_index::bit_set::MixedBitSet;
+use rustc_index::{Idx, IndexVec};
 use rustc_index::interval::{IntervalSet, SparseIntervalMatrix};
 use rustc_middle::mir::{BasicBlock, Location};
 use rustc_middle::ty::{self, RegionVid};
@@ -268,11 +268,63 @@ pub(crate) struct RegionValues<'tcx, N: Idx> {
     location_map: Rc<DenseLocationMap>,
     placeholder_indices: PlaceholderIndices<'tcx>,
     points: SparseIntervalMatrix<N, PointIndex>,
-    free_regions: SparseBitMatrix<N, RegionVid>,
+    free_regions: SparseMixedBitMatrix<N, RegionVid>,
 
     /// Placeholders represent bound regions -- so something like `'a`
     /// in `for<'a> fn(&'a u32)`.
-    placeholders: SparseBitMatrix<N, PlaceholderIndex>,
+    placeholders: SparseMixedBitMatrix<N, PlaceholderIndex>,
+}
+
+/// A sparse matrix whose rows are `MixedBitSet`s, i.e. dense bitsets for small
+/// column domains and chunked bitsets for large ones.
+///
+/// Bodies can contain many thousands of placeholders (e.g. when the trait
+/// solver instantiates higher-ranked or coroutine-witness binders), and then
+/// dense rows of `num_placeholders` bits per SCC make region propagation and
+/// `check_bound_universal_region` quadratic in time and memory. Chunked rows
+/// skip (and share) all-zero / all-one chunks, while still behaving exactly
+/// like dense rows for small domains.
+struct SparseMixedBitMatrix<R: Idx, C: Idx> {
+    num_columns: usize,
+    rows: IndexVec<R, Option<MixedBitSet<C>>>,
+}
+
+impl<R: Idx, C: Idx> SparseMixedBitMatrix<R, C> {
+    fn new(num_columns: usize) -> Self {
+        Self { num_columns, rows: IndexVec::new() }
+    }
+
+    fn ensure_row(&mut self, row: R) -> &mut MixedBitSet<C> {
+        let num_columns = self.num_columns;
+        self.rows.get_or_insert_with(row, || MixedBitSet::new_empty(num_columns))
+    }
+
+    fn insert(&mut self, row: R, column: C) -> bool {
+        self.ensure_row(row).insert(column)
+    }
+
+    fn contains(&self, row: R, column: C) -> bool {
+        self.row(row).is_some_and(|r| r.contains(column))
+    }
+
+    /// Adds the bits from row `read` to the bits from row `write`, and
+    /// returns `true` if anything changed.
+    fn union_rows(&mut self, read: R, write: R) -> bool {
+        if read == write || self.row(read).is_none() {
+            return false;
+        }
+
+        self.ensure_row(write);
+        if let (Some(read_row), Some(write_row)) = self.rows.pick2_mut(read, write) {
+            write_row.union(read_row)
+        } else {
+            unreachable!()
+        }
+    }
+
+    fn row(&self, row: R) -> Option<&MixedBitSet<C>> {
+        self.rows.get(row)?.as_ref()
+    }
 }
 
 impl<'tcx, N: Idx> RegionValues<'tcx, N> {
@@ -290,8 +342,8 @@ impl<'tcx, N: Idx> RegionValues<'tcx, N> {
             location_map,
             points: SparseIntervalMatrix::new(num_points),
             placeholder_indices,
-            free_regions: SparseBitMatrix::new(num_universal_regions),
-            placeholders: SparseBitMatrix::new(num_placeholders),
+            free_regions: SparseMixedBitMatrix::new(num_universal_regions),
+            placeholders: SparseMixedBitMatrix::new(num_placeholders),
         }
     }
 
