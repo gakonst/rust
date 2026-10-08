@@ -402,8 +402,32 @@ fn collect_items_root<'tcx>(
 ///
 /// `mode` determined whether we are scanning for [used items][CollectionMode::UsedItems]
 /// or [mentioned items][CollectionMode::MentionedItems].
-#[instrument(skip(tcx, state, recursion_depths, recursion_limit), level = "debug")]
 fn collect_items_rec<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    starting_item: Spanned<MonoItem<'tcx>>,
+    state: &SharedState<'tcx>,
+    recursion_depths: &mut DefIdMap<usize>,
+    recursion_limit: Limit,
+    mode: CollectionMode,
+    depth: usize,
+) {
+    // The walk recurses along mono item graph paths, and with the parallel frontend a thread
+    // waiting for the items it forked may run other parts of the walk on top of its stack.
+    rustc_data_structures::stack::ensure_sufficient_stack(|| {
+        collect_items_rec_inner(
+            tcx,
+            starting_item,
+            state,
+            recursion_depths,
+            recursion_limit,
+            mode,
+            depth,
+        )
+    })
+}
+
+#[instrument(skip(tcx, state, recursion_depths, recursion_limit), level = "debug")]
+fn collect_items_rec_inner<'tcx>(
     tcx: TyCtxt<'tcx>,
     starting_item: Spanned<MonoItem<'tcx>>,
     state: &SharedState<'tcx>,
