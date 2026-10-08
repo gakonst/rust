@@ -862,7 +862,11 @@ fn update_archive_in_place(
     let Ok(old) = File::open(output) else { return false };
 
     // Cheap pre-check, so that we don't compare a lot of data only to find a difference late:
-    // the existing archive must have the same members with the same sizes.
+    // the existing archive must have the same number of members with the same sizes and name
+    // lengths. Names are not required to be equal: in incremental mode, object file names
+    // contain a random per-invocation suffix of fixed length (see `OutputFilenames::
+    // temp_path_ext_for_cgu`), so they differ on every rebuild, but only in a few bytes, which
+    // are compared and patched like all others.
     {
         let Ok(old_map) = old.try_clone().and_then(|f| unsafe { Mmap::map(f) }) else {
             return false;
@@ -872,7 +876,7 @@ fn update_archive_in_place(
         for entry in entries {
             let Some(Ok(member)) = old_members.next() else { return false };
             let data: &[u8] = (*entry.buf).as_ref();
-            if member.name() != entry.member_name.as_bytes() || member.size() != data.len() as u64
+            if member.name().len() != entry.member_name.len() || member.size() != data.len() as u64
             {
                 return false;
             }
