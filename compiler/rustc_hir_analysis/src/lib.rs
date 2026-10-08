@@ -160,7 +160,11 @@ pub fn check_crate(tcx: TyCtxt<'_>) {
         let _: R = tcx.ensure_result().crate_inherent_impls_overlap_check(());
     });
 
-    tcx.par_hir_body_owners(|item_def_id| {
+    // Largest-first with dynamic (work-queue) scheduling: with the default contiguous chunking, a
+    // few expensive neighbouring items (e.g. several big `const`s with CTFE-heavy initializers in
+    // one module, or large `async fn`s) end up in the same chunk and run back to back on one
+    // thread. With a single thread the order is unchanged.
+    tcx.par_hir_body_owners_largest_first(|item_def_id| {
         let def_kind = tcx.def_kind(item_def_id);
         // Make sure we evaluate all static and (non-associated) const items, even if unused.
         // If any of these fail to evaluate, we do not want this crate to pass compilation.
