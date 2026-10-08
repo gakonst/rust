@@ -475,6 +475,35 @@ pub struct CommonLifetimes<'tcx> {
 
     /// Memo of interned anonymous canonical bound regions for larger values of `v`.
     pub anon_re_canonical_bounds_memo: DenseInternMemo<'tcx, RegionKind<'tcx>>,
+
+    /// Memo of interned anonymous placeholders
+    /// `RePlaceholder(Placeholder { universe: u, bound: BoundRegion { var: v, kind: Anon } })`,
+    /// indexed by [`anon_re_placeholder_memo_index`]. The trait solver creates such placeholders
+    /// for every placeholder in every instantiated query response.
+    pub anon_re_placeholders_memo: DenseInternMemo<'tcx, RegionKind<'tcx>>,
+}
+
+/// Bits of the bound variable in the [`CommonLifetimes::anon_re_placeholders_memo`] index.
+const ANON_RE_PLACEHOLDER_MEMO_VAR_BITS: u32 = 8;
+
+/// The index of an anonymous placeholder in [`CommonLifetimes::anon_re_placeholders_memo`], if
+/// its universe and bound variable are small enough.
+#[inline]
+pub(crate) fn anon_re_placeholder_memo_index(
+    placeholder: ty::PlaceholderRegion<'_>,
+) -> Option<usize> {
+    let ty::BoundRegion { var, kind: ty::BoundRegionKind::Anon } = placeholder.bound else {
+        return None;
+    };
+    let (universe, var) = (placeholder.universe.as_usize(), var.as_usize());
+    // Keep the index within the memo's capacity, which also makes it injective.
+    const UNIVERSE_BITS: u32 = DENSE_MEMO_FIRST_BUCKET_BITS + DENSE_MEMO_BUCKETS as u32
+        - 1
+        - ANON_RE_PLACEHOLDER_MEMO_VAR_BITS;
+    if var >= (1 << ANON_RE_PLACEHOLDER_MEMO_VAR_BITS) || universe >= (1 << UNIVERSE_BITS) {
+        return None;
+    }
+    Some((universe << ANON_RE_PLACEHOLDER_MEMO_VAR_BITS) | var)
 }
 
 pub struct CommonConsts<'tcx> {
@@ -602,6 +631,7 @@ impl<'tcx> CommonLifetimes<'tcx> {
             anon_re_canonical_bounds,
             re_vars_memo: DenseInternMemo::new(),
             anon_re_canonical_bounds_memo: DenseInternMemo::new(),
+            anon_re_placeholders_memo: DenseInternMemo::new(),
         }
     }
 }

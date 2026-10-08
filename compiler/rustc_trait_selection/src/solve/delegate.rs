@@ -392,8 +392,9 @@ impl<'tcx> rustc_next_trait_solver::delegate::SolverDelegate for SolverDelegate<
             region_constraints.constraints
         };
 
-        let mut seen = FxHashMap::default();
-        let mut constraints = vec![];
+        let mut seen =
+            FxHashMap::with_capacity_and_hasher(region_constraints.len(), Default::default());
+        let mut constraints = Vec::with_capacity(region_constraints.len());
         for QueryRegionConstraint { constraint: outlives, visible_for_leak_check: vis, .. } in
             region_constraints
         {
