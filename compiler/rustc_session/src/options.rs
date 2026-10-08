@@ -2897,6 +2897,9 @@ written to standard error output)"),
     /// o/w tests have closure@path
     span_free_formats: bool = (false, parse_bool, [UNTRACKED],
         "exclude spans when debug-printing compiler state (default: no)"),
+    split_cgu_size: Option<usize> = (None, parse_opt_number, [TRACKED],
+        "in non-incremental builds, split initial codegen units bigger than both this size estimate \
+        and 1.5 times an even share of the crate before merging them (default: 100000; 0 disables)"),
     split_dwarf_inlining: bool = (false, parse_bool, [TRACKED],
         "provide minimal debug info in the object/executable to facilitate online \
          symbolication/stack traces in the absence of .dwo/.dwp files when using Split DWARF"),
