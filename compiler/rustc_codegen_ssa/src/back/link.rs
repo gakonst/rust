@@ -1349,33 +1349,6 @@ fn link_natively(
             continue;
         }
 
-        // `-fuse-ld=mold` is only passed when `ld.mold` is installed, but the linker driver may
-        // be too old to support it (gcc < 12 without backports): use `rust-lld` as usual then.
-        if matches!(flavor, LinkerFlavor::Gnu(Cc::Yes, Lld::Yes))
-            && out.contains("-fuse-ld=mold")
-            && (unknown_arg_regex.is_match(&out)
-                || out.contains("unrecognized command-line option")
-                || out.contains("invalid linker name"))
-            && cmd.get_args().iter().any(|e| e.to_string_lossy() == "-fuse-ld=mold")
-        {
-            info!("linker output: {:?}", out);
-            info!("The linker driver does not support `-fuse-ld=mold`. Retrying with `rust-lld`.");
-            for arg in cmd.take_args() {
-                if arg.to_string_lossy() == "-fuse-ld=mold" {
-                    for path in sess.get_tools_search_paths(false) {
-                        let mut arg = OsString::from("-B");
-                        arg.push(path.join("gcc-ld"));
-                        cmd.arg(arg);
-                    }
-                    cmd.arg("-fuse-ld=lld");
-                } else {
-                    cmd.arg(arg);
-                }
-            }
-            info!("{cmd:?}");
-            continue;
-        }
-
         // Detect '-static-pie' used with an older version of gcc or clang not supporting it.
         // Fallback from '-static-pie' to '-static' in that case.
         if matches!(flavor, LinkerFlavor::Gnu(Cc::Yes, _))
@@ -4127,46 +4100,6 @@ fn get_apple_sdk_root(sess: &Session) -> Option<PathBuf> {
     apple::get_sdk_root(sess)
 }
 
-/// Whether to link with `mold` instead of the self-contained `rust-lld` the target defaults to.
-///
-/// This is only done for the GNU `cc` + `lld` flavor on Linux when no linker-related option was
-/// given on the CLI (linker, flavor, `lld` linker feature, self-contained linker, linker-plugin
-/// LTO, debuginfo compression), when the `RUSTC_NO_DEFAULT_MOLD` environment variable is unset,
-/// and when `mold` is installed as `ld.mold` (the name `cc -fuse-ld=mold` looks for) in `PATH`.
-fn default_to_mold(sess: &Session, flavor: LinkerFlavor) -> bool {
-    static MOLD_IN_PATH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-
-    let opts = &sess.opts;
-    let applicable = flavor == LinkerFlavor::Gnu(Cc::Yes, Lld::Yes)
-        && sess.target.os == Os::Linux
-        && !sess.target.is_like_wasm
-        && opts.cg.linker.is_none()
-        && opts.cg.linker_flavor.is_none()
-        && opts.cg.link_self_contained.explicitly_set.is_none()
-        && !opts.cg.link_self_contained.is_linker_disabled()
-        && opts.cg.linker_features.enabled.is_empty()
-        && opts.cg.linker_features.disabled.is_empty()
-        && !opts.cg.linker_plugin_lto.enabled()
-        && opts.unstable_opts.debuginfo_compression == config::DebugInfoCompression::None
-        && env::var_os("RUSTC_NO_DEFAULT_MOLD").is_none();
-    applicable
-        && *MOLD_IN_PATH.get_or_init(|| {
-            let Some(path) = env::var_os("PATH") else { return false };
-            env::split_paths(&path).any(|dir| {
-                fs::metadata(dir.join("ld.mold")).is_ok_and(|m| {
-                    #[cfg(unix)]
-                    let executable = {
-                        use std::os::unix::fs::PermissionsExt;
-                        m.permissions().mode() & 0o111 != 0
-                    };
-                    #[cfg(not(unix))]
-                    let executable = true;
-                    m.is_file() && executable
-                })
-            })
-        })
-}
-
 /// When using the linker flavors opting in to `lld`, add the necessary paths and arguments to
 /// invoke it:
 /// - when the self-contained linker flag is active: the build of `lld` distributed with rustc,
@@ -4197,16 +4130,6 @@ fn add_lld_args(
     let self_contained_target = self_contained_components.is_linker_enabled();
 
     let self_contained_linker = self_contained_cli || self_contained_target;
-
-    // The target merely defaults to the self-contained `rust-lld` and nothing on the CLI asks for
-    // `lld` (or another linker) specifically: if `mold` is installed, link with it instead. Both
-    // are drop-in replacements of the system linker and produce equivalent programs; `mold` is
-    // considerably faster on large links, which dominate the edit-rebuild loop of big binaries.
-    if !self_contained_cli && self_contained_target && default_to_mold(sess, flavor) {
-        cmd.cc_arg("-fuse-ld=mold");
-        return;
-    }
-
     if self_contained_linker && !sess.opts.cg.link_self_contained.is_linker_disabled() {
         let mut linker_path_exists = false;
         for path in sess.get_tools_search_paths(false) {
