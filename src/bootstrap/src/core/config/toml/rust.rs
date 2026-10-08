@@ -58,6 +58,7 @@ define_config! {
         deny_warnings: Option<bool> = "deny-warnings",
         backtrace_on_ice: Option<bool> = "backtrace-on-ice",
         verify_llvm_ir: Option<bool> = "verify-llvm-ir",
+        stable_semantics_defaults: Option<bool> = "stable-semantics-defaults",
         thin_lto_import_instr_limit: Option<u32> = "thin-lto-import-instr-limit",
         remap_debuginfo: Option<bool> = "remap-debuginfo",
         // FIXME: Remove this option in Q1 2027
@@ -381,6 +382,7 @@ pub fn check_incompatible_options_for_ci_rustc(
         deny_warnings: _,
         backtrace_on_ice: _,
         verify_llvm_ir: _,
+        stable_semantics_defaults: _,
         thin_lto_import_instr_limit: _,
         remap_debuginfo: _,
         test_compare_mode: _,

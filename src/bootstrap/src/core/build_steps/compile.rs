@@ -1372,7 +1372,10 @@ fn rustc_cargo_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetSelec
     }
 
     let nightly = builder.config.channel == "nightly" || builder.config.channel == "dev";
-    if nightly {
+    // `rust.stable-semantics-defaults = true` keeps the stable/beta defaults (old trait solver
+    // outside coherence, NLL borrowck) on a nightly/dev compiler; `-Znext-solver` and
+    // `-Zpolonius` still select the experimental implementations explicitly.
+    if nightly && !builder.config.rust_stable_semantics_defaults {
         // We want to enable Polonius Alpha and Next Trait Solver by default on nighty
         cargo.env("CFG_DEFAULT_POLONIUS_NEXT", "1");
         cargo.env("CFG_DEFAULT_NEXT_SOLVER_GLOBALLY", "1");

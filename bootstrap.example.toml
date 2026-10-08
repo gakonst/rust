@@ -856,6 +856,12 @@
 # Whether to verify generated LLVM IR
 #rust.verify-llvm-ir = false
 
+# On the nightly and dev channels, rustc defaults to the next trait solver (globally) and to
+# Polonius alpha borrowck. Set this to `true` to build a nightly/dev compiler that keeps the
+# stable-channel defaults instead (old trait solver except for coherence, NLL borrowck).
+# The experimental implementations remain available via `-Znext-solver` / `-Zpolonius`.
+#rust.stable-semantics-defaults = false
+
 # Compile the compiler with a non-default ThinLTO import limit. This import
 # limit controls the maximum size of functions imported by ThinLTO. Decreasing
 # will make code compile faster at the expense of lower runtime performance.
