@@ -12,15 +12,14 @@ use rustc_codegen_ssa::debuginfo::type_names;
 use rustc_codegen_ssa::mir::debuginfo::VariableKind;
 use rustc_codegen_ssa::mir::debuginfo::VariableKind::*;
 use rustc_codegen_ssa::traits::*;
+use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::unord::UnordMap;
 use rustc_hir::def_id::{DefId, DefIdMap};
 use rustc_middle::ty::layout::{HasTypingEnv, LayoutOf};
 use rustc_middle::ty::{self, GenericArgsRef, Instance, Ty, TypeVisitableExt, Unnormalized};
 use rustc_session::Session;
 use rustc_session::config::{self, DebugInfo};
-use rustc_span::{
-    BytePos, Pos, SourceFile, SourceFileAndLine, SourceFileHash, Span, StableSourceFileId, Symbol,
-};
+use rustc_span::{BytePos, Pos, SourceFile, SourceFileHash, Span, StableSourceFileId, Symbol};
 use rustc_target::callconv::FnAbi;
 use rustc_target::spec::DebuginfoKind;
 use smallvec::SmallVec;
@@ -58,6 +57,11 @@ pub(crate) struct CodegenUnitDebugContext<'ll, 'tcx> {
     adt_stack: RefCell<Vec<(DefId, GenericArgsRef<'tcx>)>>,
     namespace_map: RefCell<DefIdMap<&'ll DIScope>>,
     recursion_marker_type: OnceCell<&'ll DIType>,
+    /// The source file of the most recent `lookup_debug_loc`.
+    last_source_file: RefCell<Option<Arc<SourceFile>>>,
+    /// Debuginfo names of the generic type arguments of function instances, see
+    /// `type_names::push_generic_args_cached`.
+    generic_arg_type_names: RefCell<FxHashMap<Ty<'tcx>, String>>,
 }
 
 impl<'ll, 'tcx> CodegenUnitDebugContext<'ll, 'tcx> {
@@ -111,6 +115,8 @@ impl<'ll, 'tcx> CodegenUnitDebugContext<'ll, 'tcx> {
             adt_stack: Default::default(),
             namespace_map: RefCell::new(Default::default()),
             recursion_marker_type: OnceCell::new(),
+            last_source_file: RefCell::new(None),
+            generic_arg_type_names: Default::default(),
         }
     }
 
@@ -155,10 +161,11 @@ impl<'ll, 'tcx> DebugInfoBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
         let generics = tcx.generics_of(enclosing_fn_def_id);
         let args = instance.args.truncate_to(tcx, generics);
 
-        type_names::push_generic_args(
+        type_names::push_generic_args_cached(
             tcx,
             tcx.normalize_erasing_regions(self.typing_env(), Unnormalized::new_wip(args)),
             &mut name,
+            &mut utils::debug_context(self).generic_arg_type_names.borrow_mut(),
         );
 
         let template_parameters = get_template_parameters(self, generics, args);
@@ -684,17 +691,18 @@ impl<'ll> CodegenCx<'ll, '_> {
     // `lookup_char_pos` rather than `dbg_loc`, perhaps by making
     // `lookup_char_pos` return the right information instead.
     fn lookup_debug_loc(&self, pos: BytePos) -> DebugLoc {
-        let (file, line, col) = match self.sess().source_map().lookup_line(pos) {
-            Ok(SourceFileAndLine { sf: file, line }) => {
+        let file = self.lookup_source_file_for_debuginfo(pos);
+        let (line, col) = match file.lookup_line(file.relative_position(pos)) {
+            Some(line) => {
                 let line_pos = file.lines()[line];
 
                 // Use 1-based indexing.
                 let line = (line + 1) as u32;
                 let col = (file.relative_position(pos) - line_pos).to_u32() + 1;
 
-                (file, line, col)
+                (line, col)
             }
-            Err(file) => (file, UNKNOWN_LINE_NUMBER, UNKNOWN_COLUMN_NUMBER),
+            None => (UNKNOWN_LINE_NUMBER, UNKNOWN_COLUMN_NUMBER),
         };
 
         // For MSVC, omit the column number.
@@ -705,6 +713,28 @@ impl<'ll> CodegenCx<'ll, '_> {
         } else {
             DebugLoc { file, line, col }
         }
+    }
+
+    /// Equivalent to `self.sess().source_map().lookup_source_file(pos)`, but remembers the
+    /// last file that was found: consecutive debug locations are almost always in the same
+    /// file, so this avoids a binary search over all (including all imported) source files
+    /// and the source map lock for most lookups. Files never overlap (the source map leaves
+    /// a gap of at least one byte between them), so `pos` is in the remembered file iff it is
+    /// in its `start_pos..=end_position()` range.
+    fn lookup_source_file_for_debuginfo(&self, pos: BytePos) -> Arc<SourceFile> {
+        let Some(dbg_cx) = &self.dbg_cx else {
+            return self.sess().source_map().lookup_source_file(pos);
+        };
+        let mut last = dbg_cx.last_source_file.borrow_mut();
+        if let Some(file) = &*last
+            && file.start_pos <= pos
+            && pos <= file.end_position()
+        {
+            return Arc::clone(file);
+        }
+        let file = self.sess().source_map().lookup_source_file(pos);
+        *last = Some(Arc::clone(&file));
+        file
     }
 
     fn create_template_type_parameter(
