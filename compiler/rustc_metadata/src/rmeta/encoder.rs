@@ -727,6 +727,13 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                     self.encode_exported_symbols(tcx.exported_generic_symbols(LOCAL_CRATE)),
                 )
             });
+        // Must agree with what `encode_exported_symbols` encodes (nothing for proc-macros).
+        let exported_generic_symbols_have_c_level = !self.is_proc_macro
+            && tcx.exported_generic_symbols(LOCAL_CRATE).iter().any(|(_, info)| {
+                info.level != rustc_middle::middle::exported_symbols::SymbolExportLevel::Rust
+                    || info.used
+                    || info.rustc_std_internal_symbol
+            });
 
         // Encode the hygiene data.
         // IMPORTANT: this *must* be the last thing that we encode (other than `SourceMap`). The
@@ -796,6 +803,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                 stable_order_of_exportable_impls,
                 exported_non_generic_symbols,
                 exported_generic_symbols,
+                exported_generic_symbols_have_c_level,
                 interpret_alloc_index,
                 tables,
                 syntax_contexts,

@@ -315,6 +315,13 @@ impl CStore {
         self.has_global_allocator
     }
 
+    /// Whether any of the generic symbols exported by the upstream crate `cnum` has
+    /// `SymbolExportLevel::C`, `used` or `rustc_std_internal_symbol` set. If this returns
+    /// `false`, every entry of `exported_generic_symbols(cnum)` is a plain Rust-level symbol.
+    pub fn exported_generic_symbols_have_c_level(&self, cnum: CrateNum) -> bool {
+        self.get_crate_data(cnum).exported_generic_symbols_have_c_level()
+    }
+
     pub(crate) fn has_alloc_error_handler(&self) -> bool {
         self.has_alloc_error_handler
     }
