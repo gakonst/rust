@@ -383,10 +383,19 @@ impl<'tcx> rustc_next_trait_solver::delegate::SolverDelegate for SolverDelegate<
             )
         });
 
+        // After analysis, region constraints of nested goals are never used for
+        // diagnostics, so we eagerly split type outlives constraints into their
+        // components. See `decompose_type_outlives_constraints` for more details.
+        let region_constraints = if self.should_eagerly_decompose_type_outlives() {
+            decompose_type_outlives_constraints(&self.0, region_constraints.constraints)
+        } else {
+            region_constraints.constraints
+        };
+
         let mut seen = FxHashMap::default();
         let mut constraints = vec![];
         for QueryRegionConstraint { constraint: outlives, visible_for_leak_check: vis, .. } in
-            region_constraints.constraints
+            region_constraints
         {
             match seen.entry(outlives) {
                 Entry::Occupied(occupied) => {
@@ -614,4 +623,106 @@ impl<'tcx> ProofTreeVisitor<'tcx> for OverflowedGoalChain<'tcx> {
     fn on_recursion_limit(&mut self) -> Self::Result {
         ControlFlow::Break(())
     }
+}
+
+impl<'tcx> SolverDelegate<'tcx> {
+    /// Whether `make_deduplicated_region_constraints` may split `T: 'r` constraints into the
+    /// outlives components of `T` before returning them in a query response.
+    ///
+    /// This is only done after analysis: in these typing modes, region constraints are not used to
+    /// report errors, so the `SubregionOrigin` the caller would use when processing the
+    /// undecomposed constraint does not matter. `-Zhigher-ranked-assumptions` matches entire
+    /// `T: 'r` constraints against assumptions, so we keep them intact if it is enabled.
+    fn should_eagerly_decompose_type_outlives(&self) -> bool {
+        let tcx = self.tcx;
+        if tcx.assumptions_on_binders() || tcx.sess.opts.unstable_opts.higher_ranked_assumptions {
+            return false;
+        }
+
+        match self.typing_mode_raw() {
+            TypingMode::PostAnalysis | TypingMode::Codegen => true,
+            TypingMode::Coherence
+            | TypingMode::Typeck { .. }
+            | TypingMode::PostTypeckUntilBorrowck { .. }
+            | TypingMode::Reflection
+            | TypingMode::PostBorrowck { .. }
+            | TypingMode::ErasedNotCoherence(MayBeErased) => false,
+        }
+    }
+}
+
+/// Splits each `T: 'r` constraint of a query response into the outlives components of `T`, e.g.
+/// `Foo<'a, U, Vec<&'b ()>>: 'r` is replaced by `'a: 'r`, `U: 'r` and `'b: 'r`.
+///
+/// This is exactly what the caller does when it eventually processes the type outlives
+/// constraint, see `TypeOutlives::type_must_outlive`, so this does not change which regions
+/// have to outlive each other. However, it is a lot cheaper: type outlives constraints are
+/// propagated undecomposed through every query response up the goal stack and get
+/// canonicalized and instantiated again for every goal. With huge types, e.g. `async fn`
+/// futures which have to be `'static` to be spawned, this is quadratic or worse.
+///
+/// Type outlives constraints are never visible for the leak check, so we use
+/// `VisibleForLeakCheck::No` for the resulting region constraints. We keep the constraint
+/// undecomposed if any of its components is not trivially handled by the caller in the same
+/// way, i.e. aliases (which may be proven via where-clauses or item bounds), aliases with
+/// escaping bound vars and inference variables.
+fn decompose_type_outlives_constraints<'tcx>(
+    infcx: &InferCtxt<'tcx>,
+    constraints: Vec<QueryRegionConstraint<'tcx>>,
+) -> Vec<QueryRegionConstraint<'tcx>> {
+    use rustc_middle::ty::outlives::{Component, push_outlives_components};
+
+    let tcx = infcx.tcx;
+    if !constraints.iter().any(|c| {
+        matches!(
+            c.constraint,
+            ty::RegionConstraint::Outlives(ty::OutlivesClause(arg, _)) if arg.as_type().is_some()
+        )
+    }) {
+        return constraints;
+    }
+
+    let mut result = Vec::with_capacity(constraints.len());
+    let mut components = smallvec::SmallVec::<[Component<TyCtxt<'tcx>>; 4]>::new();
+    let mut decomposed = Vec::new();
+    'constraints: for constraint in constraints {
+        let ty::RegionConstraint::Outlives(ty::OutlivesClause(arg, r)) = constraint.constraint
+        else {
+            result.push(constraint);
+            continue;
+        };
+        let Some(ty) = arg.as_type() else {
+            result.push(constraint);
+            continue;
+        };
+        let ty = infcx.deeply_resolve_ignoring_regions(ty);
+        if ty.has_escaping_bound_vars() || ty.has_non_region_infer() {
+            result.push(constraint);
+            continue;
+        }
+
+        components.clear();
+        decomposed.clear();
+        push_outlives_components(tcx, ty, &mut components);
+        for component in &components {
+            let arg: ty::GenericArg<'tcx> = match *component {
+                Component::Region(component) => component.into(),
+                Component::Param(p) => Ty::new_param(tcx, p.index, p.name).into(),
+                Component::Placeholder(p) => Ty::new_placeholder(tcx, p).into(),
+                Component::Alias(..)
+                | Component::EscapingAlias(_)
+                | Component::UnresolvedInferenceVariable(_) => {
+                    result.push(constraint);
+                    continue 'constraints;
+                }
+            };
+            decomposed.push(QueryRegionConstraint {
+                constraint: ty::OutlivesClause(arg, r).into(),
+                category: constraint.category,
+                visible_for_leak_check: ty::VisibleForLeakCheck::No,
+            });
+        }
+        result.extend(decomposed.drain(..));
+    }
+    result
 }
