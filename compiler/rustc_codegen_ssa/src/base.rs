@@ -855,6 +855,35 @@ pub fn codegen_crate<
 
         match cgu_reuse {
             CguReuse::No => {
+                // With the parallel frontend, the main thread would otherwise translate the
+                // remaining CGUs to LLVM IR one at a time, which often leaves the LLVM workers
+                // waiting for work (especially in unoptimized builds, where LLVM is fast).
+                // So whenever the buffer of pre-compiled CGUs runs dry, translate the next batch
+                // of CGUs in parallel. The modules are submitted in the same order as before.
+                if let Some(threads) = tcx.sess.opts.jobs.frontend
+                    && threads.get() > 1
+                    && !pre_compiled_cgus.contains_key(&i)
+                {
+                    let batch: Vec<usize> = (i..codegen_units.len())
+                        .filter(|&j| {
+                            cgu_reuse[j] == CguReuse::No && !pre_compiled_cgus.contains_key(&j)
+                        })
+                        .take(threads.get())
+                        .collect();
+                    if batch.len() > 1 {
+                        let start_time = Instant::now();
+                        let compiled: Vec<_> = par_map(batch, |j| {
+                            let module = backend.compile_codegen_unit(
+                                tcx,
+                                codegen_units[j].name(),
+                                bitcode_needed,
+                            );
+                            (j, IntoDynSyncSend(module))
+                        });
+                        total_codegen_time += start_time.elapsed();
+                        pre_compiled_cgus.extend(compiled);
+                    }
+                }
                 let (module, cost) = if let Some(cgu) = pre_compiled_cgus.remove(&i) {
                     cgu.0
                 } else {
