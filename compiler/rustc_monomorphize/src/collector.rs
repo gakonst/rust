@@ -356,6 +356,14 @@ impl<'tcx> Extend<Spanned<MonoItem<'tcx>>> for MonoItems<'tcx> {
 /// item in parallel (with the parallel frontend).
 const PAR_COLLECT_MAX_DEPTH_DEFAULT: usize = 32;
 
+// EXPERIMENT ONLY (exp-i): histogram of walk depths (RUSTC_EXP_PAR_COLLECT_STATS=1), bucket = depth / 8.
+static EXP_DEPTH_HIST: [std::sync::atomic::AtomicUsize; 64] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 64];
+fn exp_stats() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var_os("RUSTC_EXP_PAR_COLLECT_STATS").is_some())
+}
+
 // EXPERIMENT ONLY (exp-i): tunable via RUSTC_EXP_PAR_COLLECT_DEPTH.
 fn par_collect_max_depth() -> usize {
     static D: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -407,6 +415,9 @@ fn collect_items_rec<'tcx>(
     let mut used_items = MonoItems::new();
     let mut mentioned_items = MonoItems::new();
     let recursion_depth_reset;
+    if exp_stats() && mode == CollectionMode::UsedItems {
+        EXP_DEPTH_HIST[(depth / 8).min(63)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 
     // Post-monomorphization errors MVP
     //
@@ -1977,6 +1988,16 @@ pub(crate) fn collect_crate_mono_items<'tcx>(
             collect_items_root(tcx, dummy_spanned(*root), &state, recursion_limit);
         });
     });
+
+    if exp_stats() {
+        let h: Vec<_> = EXP_DEPTH_HIST
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i * 8, c.load(std::sync::atomic::Ordering::Relaxed)))
+            .filter(|&(_, c)| c > 0)
+            .collect();
+        eprintln!("EXP_PAR_COLLECT depth hist (depth/8*8, used items): {h:?}");
+    }
 
     // The set of MonoItems was created in an inherently indeterministic order because
     // of parallelism. We sort it here to ensure that the output is deterministic.
