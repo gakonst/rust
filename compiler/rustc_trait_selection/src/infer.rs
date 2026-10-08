@@ -178,4 +178,22 @@ impl<'tcx> InferCtxtBuilder<'tcx> {
         let value = operation(&ocx, key)?;
         ocx.make_canonicalized_query_response(var_values, value)
     }
+
+    /// Like `enter_canonical_trait_query`, but for the type op queries of MIR borrowck, see
+    /// [`InferCtxt::make_canonicalized_nll_type_op_response`].
+    fn enter_canonical_nll_type_op_query<K, R>(
+        self,
+        canonical_key: &CanonicalQueryInput<'tcx, K>,
+        operation: impl FnOnce(&ObligationCtxt<'_, 'tcx>, K) -> Result<R, NoSolution>,
+    ) -> Result<CanonicalQueryResponse<'tcx, R>, NoSolution>
+    where
+        K: TypeFoldable<TyCtxt<'tcx>>,
+        R: Debug + TypeFoldable<TyCtxt<'tcx>>,
+        Canonical<'tcx, QueryResponse<'tcx, R>>: ArenaAllocatable<'tcx>,
+    {
+        let (infcx, key, var_values) = self.build_with_canonical(DUMMY_SP, canonical_key);
+        let ocx = ObligationCtxt::new(&infcx);
+        let value = operation(&ocx, key)?;
+        ocx.make_canonicalized_nll_type_op_response(var_values, value)
+    }
 }

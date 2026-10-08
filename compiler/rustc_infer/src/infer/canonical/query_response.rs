@@ -13,7 +13,9 @@ use std::iter;
 use rustc_index::{Idx, IndexVec};
 use rustc_middle::arena::ArenaAllocatable;
 use rustc_middle::infer::canonical::{CanonicalVarKind, QueryRegionConstraint};
-use rustc_middle::ty::{self, BoundVar, GenericArg, GenericArgKind, Ty, TyCtxt, TypeFoldable};
+use rustc_middle::ty::{
+    self, BoundVar, GenericArg, GenericArgKind, Ty, TyCtxt, TypeFoldable, TypeVisitableExt,
+};
 use rustc_span::bug;
 use tracing::{debug, instrument};
 
@@ -63,7 +65,44 @@ impl<'tcx> InferCtxt<'tcx> {
         T: Debug + TypeFoldable<TyCtxt<'tcx>>,
         Canonical<'tcx, QueryResponse<'tcx, T>>: ArenaAllocatable<'tcx>,
     {
-        let query_response = self.make_query_response(inference_vars, answer, fulfill_cx)?;
+        self.make_canonicalized_query_response_inner(inference_vars, answer, fulfill_cx, false)
+    }
+
+    /// Like [`Self::make_canonicalized_query_response`], but for the type op queries used by
+    /// MIR borrowck (`type_op_prove_predicate` etc.), whose region constraints are only ever
+    /// consumed by `ConstraintConversion` after being instantiated in the caller.
+    ///
+    /// `ConstraintConversion` handles a `T: 'r` constraint by splitting `T` into its outlives
+    /// components (`TypeOutlives::type_must_outlive`). We do that split here, once per query,
+    /// instead of returning the whole type: for huge types (e.g. `async fn` futures that need
+    /// to be `'static` to be spawned) instantiating the undecomposed type for every use of the
+    /// cached query result dominated borrowck. See `split_type_outlives_constraints`.
+    pub fn make_canonicalized_nll_type_op_response<T>(
+        &self,
+        inference_vars: CanonicalVarValues<'tcx>,
+        answer: T,
+        fulfill_cx: &mut dyn TraitEngine<'tcx, ScrubbedTraitError<'tcx>>,
+    ) -> Result<CanonicalQueryResponse<'tcx, T>, NoSolution>
+    where
+        T: Debug + TypeFoldable<TyCtxt<'tcx>>,
+        Canonical<'tcx, QueryResponse<'tcx, T>>: ArenaAllocatable<'tcx>,
+    {
+        self.make_canonicalized_query_response_inner(inference_vars, answer, fulfill_cx, true)
+    }
+
+    fn make_canonicalized_query_response_inner<T>(
+        &self,
+        inference_vars: CanonicalVarValues<'tcx>,
+        answer: T,
+        fulfill_cx: &mut dyn TraitEngine<'tcx, ScrubbedTraitError<'tcx>>,
+        split_type_outlives: bool,
+    ) -> Result<CanonicalQueryResponse<'tcx, T>, NoSolution>
+    where
+        T: Debug + TypeFoldable<TyCtxt<'tcx>>,
+        Canonical<'tcx, QueryResponse<'tcx, T>>: ArenaAllocatable<'tcx>,
+    {
+        let query_response =
+            self.make_query_response(inference_vars, answer, fulfill_cx, split_type_outlives)?;
         debug!("query_response = {:#?}", query_response);
         let canonical_result = self.canonicalize_response(query_response);
         debug!("canonical_result = {:#?}", canonical_result);
@@ -124,6 +163,7 @@ impl<'tcx> InferCtxt<'tcx> {
         inference_vars: CanonicalVarValues<'tcx>,
         answer: T,
         fulfill_cx: &mut dyn TraitEngine<'tcx, ScrubbedTraitError<'tcx>>,
+        split_type_outlives: bool,
     ) -> Result<QueryResponse<'tcx, T>, NoSolution>
     where
         T: Debug + TypeFoldable<TyCtxt<'tcx>>,
@@ -146,13 +186,17 @@ impl<'tcx> InferCtxt<'tcx> {
         let region_obligations = self.take_registered_region_obligations();
         let region_assumptions = self.take_registered_region_assumptions();
         debug!(?region_obligations);
-        let region_constraints = self.with_region_constraints(|region_constraints| {
+        let mut region_constraints = self.with_region_constraints(|region_constraints| {
             make_query_region_constraints(
                 region_obligations,
                 region_constraints,
                 region_assumptions,
             )
         });
+        if split_type_outlives {
+            region_constraints.constraints =
+                self.split_type_outlives_constraints(region_constraints.constraints);
+        }
         debug!(?region_constraints);
 
         let opaque_types = self
@@ -170,6 +214,80 @@ impl<'tcx> InferCtxt<'tcx> {
             value: answer,
             opaque_types,
         })
+    }
+
+    /// Replaces each `T: 'r` constraint by the constraints `ConstraintConversion` would derive
+    /// from it via `TypeOutlives::type_must_outlive`, i.e. one `C: 'r` per outlives component
+    /// `C` of `T` (regions, type parameters, placeholders and aliases), in place and in the same
+    /// order, with the same category. A constraint is kept whole if `T` has escaping bound vars
+    /// or unresolved non-region inference variables, or if any of its components is an alias
+    /// with escaping bound vars; these are handled by the caller exactly as before.
+    ///
+    /// This is disabled with `-Zhigher-ranked-assumptions` and `-Zassumptions-on-binders`,
+    /// which match whole `T: 'r` constraints against assumptions.
+    fn split_type_outlives_constraints(
+        &self,
+        constraints: Vec<QueryRegionConstraint<'tcx>>,
+    ) -> Vec<QueryRegionConstraint<'tcx>> {
+        use rustc_middle::ty::outlives::{Component, push_outlives_components};
+
+        let tcx = self.tcx;
+        if tcx.sess.opts.unstable_opts.higher_ranked_assumptions
+            || tcx.assumptions_on_binders()
+            || !constraints.iter().any(|c| {
+                matches!(
+                    c.constraint,
+                    ty::RegionConstraint::Outlives(ty::OutlivesClause(arg, _))
+                        if arg.as_type().is_some()
+                )
+            })
+        {
+            return constraints;
+        }
+
+        let mut result = Vec::with_capacity(constraints.len());
+        let mut components = smallvec::SmallVec::<[Component<TyCtxt<'tcx>>; 4]>::new();
+        for constraint in constraints {
+            let ty::RegionConstraint::Outlives(ty::OutlivesClause(arg, r)) = constraint.constraint
+            else {
+                result.push(constraint);
+                continue;
+            };
+            let Some(ty) = arg.as_type() else {
+                result.push(constraint);
+                continue;
+            };
+            let ty = self.deeply_resolve_ignoring_regions(ty);
+            if ty.has_escaping_bound_vars() || ty.has_non_region_infer() {
+                result.push(constraint);
+                continue;
+            }
+
+            components.clear();
+            push_outlives_components(tcx, ty, &mut components);
+            if components.iter().any(|c| {
+                matches!(c, Component::EscapingAlias(_) | Component::UnresolvedInferenceVariable(_))
+            }) {
+                result.push(constraint);
+                continue;
+            }
+            result.extend(components.iter().map(|component| {
+                let arg: GenericArg<'tcx> = match *component {
+                    Component::Region(region) => region.into(),
+                    Component::Param(p) => Ty::new_param(tcx, p.index, p.name).into(),
+                    Component::Placeholder(p) => Ty::new_placeholder(tcx, p).into(),
+                    Component::Alias(is_rigid, alias_ty) => alias_ty.to_ty(tcx, is_rigid).into(),
+                    Component::EscapingAlias(_) | Component::UnresolvedInferenceVariable(_) => {
+                        unreachable!()
+                    }
+                };
+                QueryRegionConstraint {
+                    constraint: ty::OutlivesClause(arg, r).into(),
+                    ..constraint
+                }
+            }));
+        }
+        result
     }
 
     /// Given the (canonicalized) result to a canonical query,

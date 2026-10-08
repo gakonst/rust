@@ -400,6 +400,23 @@ impl<'tcx> ObligationCtxt<'_, 'tcx, ScrubbedTraitError<'tcx>> {
             &mut *self.engine.borrow_mut(),
         )
     }
+
+    /// See [`InferCtxt::make_canonicalized_nll_type_op_response`].
+    pub fn make_canonicalized_nll_type_op_response<T>(
+        &self,
+        inference_vars: CanonicalVarValues<'tcx>,
+        answer: T,
+    ) -> Result<CanonicalQueryResponse<'tcx, T>, NoSolution>
+    where
+        T: Debug + TypeFoldable<TyCtxt<'tcx>>,
+        Canonical<'tcx, QueryResponse<'tcx, T>>: ArenaAllocatable<'tcx>,
+    {
+        self.infcx.make_canonicalized_nll_type_op_response(
+            inference_vars,
+            answer,
+            &mut *self.engine.borrow_mut(),
+        )
+    }
 }
 
 impl<'tcx, E> ObligationCtxt<'_, 'tcx, E>
