@@ -3,6 +3,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
+use std::time::{Duration, Instant};
 use std::{fmt, io, mem, ptr, thread};
 
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
@@ -14,7 +15,8 @@ use crate::sleep::Sleep;
 use crate::tlv::Tlv;
 use crate::{
     AcquireThreadHandler, DeadlockHandler, ErrorKind, ExitHandler, PanicHandler,
-    ReleaseThreadHandler, StartHandler, ThreadPoolBuildError, ThreadPoolBuilder, Yield, unwind,
+    ReleaseThreadHandler, StartHandler, ThreadPoolBuildError, ThreadPoolBuilder, Yield,
+    YieldThreadHandler, unwind,
 };
 
 /// Thread builder used for customization via
@@ -136,6 +138,7 @@ pub struct Registry {
     exit_handler: Option<Box<ExitHandler>>,
     pub(crate) acquire_thread_handler: Option<Box<AcquireThreadHandler>>,
     pub(crate) release_thread_handler: Option<Box<ReleaseThreadHandler>>,
+    yield_thread_handler: Option<Box<YieldThreadHandler>>,
 
     // When this latch reaches 0, it means that all work on this
     // registry must be complete. This is ensured in the following ways:
@@ -294,6 +297,7 @@ impl Registry {
             exit_handler: builder.take_exit_handler(),
             acquire_thread_handler: builder.take_acquire_thread_handler(),
             release_thread_handler: builder.take_release_thread_handler(),
+            yield_thread_handler: builder.take_yield_thread_handler(),
         });
 
         // If we return early or panic, make sure to terminate existing threads.
@@ -690,7 +694,13 @@ pub(super) struct WorkerThread {
     rng: XorShift64Star,
 
     pub(crate) registry: Arc<Registry>,
+
+    /// When this thread last invoked the registry's yield thread handler.
+    last_yield: Cell<Instant>,
 }
+
+/// How often busy worker threads invoke the yield thread handler (between jobs).
+const YIELD_INTERVAL: Duration = Duration::from_millis(20);
 
 // This is a bit sketchy, but basically: the WorkerThread is
 // allocated on the stack of the worker on entry and stored into this
@@ -710,6 +720,7 @@ impl From<ThreadBuilder> for WorkerThread {
             index: thread.index,
             rng: XorShift64Star::new(),
             registry: thread.registry,
+            last_yield: Cell::new(Instant::now()),
         }
     }
 }
@@ -889,6 +900,7 @@ impl WorkerThread {
             // especially to avoid modifying shared sleep state.
             if let Some(job) = self.take_local_job() {
                 unsafe { self.execute(job) };
+                self.maybe_yield();
                 continue;
             }
 
@@ -897,6 +909,7 @@ impl WorkerThread {
                 if let Some(job) = self.find_work() {
                     self.registry.sleep.work_found();
                     unsafe { self.execute(job) };
+                    self.maybe_yield();
                     // The job might have injected local work, so go back to the outer loop.
                     continue 'outer;
                 } else {
@@ -947,6 +960,19 @@ impl WorkerThread {
 
         // Let registry know we are done
         unsafe { Latch::set(&registry.thread_infos[index].stopped) };
+    }
+
+    /// Invokes the registry's yield thread handler if this thread has not done so for
+    /// `YIELD_INTERVAL`. Called between jobs.
+    #[inline]
+    fn maybe_yield(&self) {
+        if let Some(ref yield_thread_handler) = self.registry.yield_thread_handler {
+            let now = Instant::now();
+            if now.duration_since(self.last_yield.get()) >= YIELD_INTERVAL {
+                yield_thread_handler();
+                self.last_yield.set(Instant::now());
+            }
+        }
     }
 
     fn find_work(&self) -> Option<JobRef> {
