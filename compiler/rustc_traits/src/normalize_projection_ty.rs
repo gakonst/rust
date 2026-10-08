@@ -1,4 +1,4 @@
-use rustc_infer::infer::{InferCtxtBuilder, TyCtxtInferExt};
+use rustc_infer::infer::TyCtxtInferExt;
 use rustc_infer::infer::canonical::{Canonical, QueryResponse};
 use rustc_infer::traits::PredicateObligations;
 use rustc_middle::query::Providers;
@@ -13,7 +13,6 @@ use tracing::debug;
 pub(crate) fn provide(p: &mut Providers) {
     *p = Providers {
         normalize_canonicalized_projection,
-        normalize_canonicalized_projection_ignoring_regions,
         normalize_canonicalized_free_alias,
         normalize_canonicalized_inherent_projection,
         ..*p
@@ -44,23 +43,8 @@ fn normalize_canonicalized_projection<'tcx>(
     goal: CanonicalAliasGoal<'tcx>,
 ) -> Result<&'tcx Canonical<'tcx, QueryResponse<'tcx, NormalizationResult<'tcx>>>, NoSolution> {
     debug!("normalize_canonicalized_projection(goal={:#?})", goal);
-    normalize_canonicalized_projection_in(tcx, tcx.infer_ctxt(), goal)
-}
 
-fn normalize_canonicalized_projection_ignoring_regions<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    goal: CanonicalAliasGoal<'tcx>,
-) -> Result<&'tcx Canonical<'tcx, QueryResponse<'tcx, NormalizationResult<'tcx>>>, NoSolution> {
-    debug!("normalize_canonicalized_projection_ignoring_regions(goal={:#?})", goal);
-    normalize_canonicalized_projection_in(tcx, tcx.infer_ctxt().ignoring_regions(), goal)
-}
-
-fn normalize_canonicalized_projection_in<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    infcx_builder: InferCtxtBuilder<'tcx>,
-    goal: CanonicalAliasGoal<'tcx>,
-) -> Result<&'tcx Canonical<'tcx, QueryResponse<'tcx, NormalizationResult<'tcx>>>, NoSolution> {
-    infcx_builder.enter_canonical_trait_query(
+    tcx.infer_ctxt().enter_canonical_trait_query(
         &goal,
         |ocx, ParamEnvAnd { param_env, value: goal }| {
             debug_assert!(!ocx.infcx.next_trait_solver());

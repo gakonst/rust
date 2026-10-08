@@ -345,27 +345,7 @@ impl<'a, 'tcx> QueryNormalizer<'a, 'tcx> {
         debug!("QueryNormalizer: orig_values = {:#?}", orig_values);
         let result = match term.kind {
             ty::AliasTermKind::ProjectionTy { .. } | ty::AliasTermKind::ProjectionConst { .. } => {
-                // If this inference context ignores regions in codegen (e.g. the one of
-                // `normalize_erasing_regions`), all region constraints of the response would
-                // be dropped anyway, so let the query ignore regions as well. That allows it to
-                // prove the nested obligations via the evaluation cache, see
-                // `FulfillProcessor::evaluate_to_holds`.
-                let regions_are_irrelevant = !infcx.considering_regions
-                    && match infcx.typing_mode_raw() {
-                        TypingMode::Codegen => true,
-                        TypingMode::Coherence
-                        | TypingMode::Typeck { .. }
-                        | TypingMode::PostTypeckUntilBorrowck { .. }
-                        | TypingMode::PostBorrowck { .. }
-                        | TypingMode::PostAnalysis
-                        | TypingMode::Reflection
-                        | TypingMode::ErasedNotCoherence(_) => false,
-                    };
-                if regions_are_irrelevant {
-                    tcx.normalize_canonicalized_projection_ignoring_regions(c_term)
-                } else {
-                    tcx.normalize_canonicalized_projection(c_term)
-                }
+                tcx.normalize_canonicalized_projection(c_term)
             }
             ty::AliasTermKind::FreeTy { .. } | ty::AliasTermKind::FreeConst { .. } => {
                 tcx.normalize_canonicalized_free_alias(c_term)
