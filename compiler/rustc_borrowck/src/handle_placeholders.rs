@@ -2,7 +2,6 @@
 //! (with placeholders and universes) and turn them into regular
 //! outlives constraints.
 use rustc_data_structures::frozen::Frozen;
-use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::graph::scc;
 use rustc_data_structures::graph::scc::Sccs;
 use rustc_index::IndexVec;
@@ -13,7 +12,7 @@ use tracing::{debug, trace};
 
 use crate::constraints::{ConstraintSccIndex, OutlivesConstraintSet};
 use crate::consumers::OutlivesConstraint;
-use crate::diagnostics::UniverseInfo;
+use crate::diagnostics::UniverseCauses;
 use crate::region_infer::values::{LivenessValues, PlaceholderIndices};
 use crate::region_infer::{ConstraintSccs, RegionDefinition, Representative, TypeTest};
 use crate::ty::VarianceDiagInfo;
@@ -31,7 +30,7 @@ pub(crate) struct LoweredConstraints<'tcx> {
     pub(crate) outlives_constraints: Frozen<OutlivesConstraintSet<'tcx>>,
     pub(crate) type_tests: Vec<TypeTest<'tcx>>,
     pub(crate) liveness_constraints: LivenessValues,
-    pub(crate) universe_causes: FxIndexMap<UniverseIndex, UniverseInfo<'tcx>>,
+    pub(crate) universe_causes: UniverseCauses<'tcx>,
     pub(crate) placeholder_indices: PlaceholderIndices<'tcx>,
 }
 

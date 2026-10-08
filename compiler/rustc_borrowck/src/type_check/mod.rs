@@ -6,7 +6,7 @@ use std::{fmt, iter, mem};
 use rustc_abi::FieldIdx;
 use rustc_attr_ir::lang_items::LangItem;
 use rustc_data_structures::frozen::Frozen;
-use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
+use rustc_data_structures::fx::FxIndexSet;
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir as hir;
 use rustc_hir::def::DefKind;
@@ -40,7 +40,7 @@ use tracing::{debug, instrument, trace};
 
 use crate::borrow_set::BorrowSet;
 use crate::constraints::{OutlivesConstraint, OutlivesConstraintSet};
-use crate::diagnostics::UniverseInfo;
+use crate::diagnostics::UniverseCauses;
 use crate::polonius::PoloniusContext;
 use crate::polonius::legacy::{PoloniusFacts, PoloniusLocationTable};
 use crate::region_infer::TypeTest;
@@ -111,7 +111,7 @@ pub(crate) fn type_check<'tcx>(
         liveness_constraints: LivenessValues::with_specific_points(Rc::clone(&location_map)),
         outlives_constraints: OutlivesConstraintSet::default(),
         type_tests: Vec::default(),
-        universe_causes: FxIndexMap::default(),
+        universe_causes: UniverseCauses::default(),
     };
 
     let CreateResult {
@@ -288,7 +288,7 @@ pub(crate) struct MirTypeckRegionConstraints<'tcx> {
 
     pub(crate) outlives_constraints: OutlivesConstraintSet<'tcx>,
 
-    pub(crate) universe_causes: FxIndexMap<ty::UniverseIndex, UniverseInfo<'tcx>>,
+    pub(crate) universe_causes: UniverseCauses<'tcx>,
 
     pub(crate) type_tests: Vec<TypeTest<'tcx>>,
 }

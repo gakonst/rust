@@ -56,7 +56,7 @@ mod mutability_errors;
 mod opaque_types;
 mod region_errors;
 
-pub(crate) use bound_region_errors::{ToUniverseInfo, UniverseInfo};
+pub(crate) use bound_region_errors::{ToUniverseInfo, UniverseCauses, UniverseInfo};
 pub(crate) use move_errors::{IllegalMoveOriginKind, MoveError};
 pub(crate) use mutability_errors::AccessKind;
 pub(crate) use outlives_suggestion::OutlivesSuggestionBuilder;

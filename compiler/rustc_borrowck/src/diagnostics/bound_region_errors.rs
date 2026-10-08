@@ -29,6 +29,45 @@ use crate::session_diagnostics::{
     HigherRankedErrorCause, HigherRankedLifetimeError, HigherRankedSubtypeError,
 };
 
+/// Why the universes created during MIR type-checking were created, for diagnostics.
+///
+/// Type ops can create long runs of consecutive universes (one per placeholder in their
+/// canonical response) that all share the same cause, so we store ranges of universes
+/// rather than one map entry per universe. Like a map insertion, a later registration
+/// takes precedence over earlier ones for the same universe.
+#[derive(Clone, Default)]
+pub(crate) struct UniverseCauses<'tcx> {
+    /// Inclusive ranges of universes with their cause, in registration order.
+    ranges: Vec<(UniverseIndex, UniverseIndex, UniverseInfo<'tcx>)>,
+}
+
+impl<'tcx> UniverseCauses<'tcx> {
+    /// Registers `info` as the cause of the universes `first..=last`.
+    pub(crate) fn insert_range(
+        &mut self,
+        first: UniverseIndex,
+        last: UniverseIndex,
+        info: UniverseInfo<'tcx>,
+    ) {
+        if first <= last {
+            self.ranges.push((first, last, info));
+        }
+    }
+
+    pub(crate) fn insert(&mut self, universe: UniverseIndex, info: UniverseInfo<'tcx>) {
+        self.insert_range(universe, universe, info);
+    }
+
+    /// Only used when reporting errors, so a linear scan is fine.
+    pub(crate) fn get(&self, universe: UniverseIndex) -> Option<&UniverseInfo<'tcx>> {
+        self.ranges
+            .iter()
+            .rev()
+            .find(|(first, last, _)| *first <= universe && universe <= *last)
+            .map(|(_, _, info)| info)
+    }
+}
+
 /// What operation a universe was created for.
 #[derive(Clone)]
 pub(crate) enum UniverseInfo<'tcx> {
