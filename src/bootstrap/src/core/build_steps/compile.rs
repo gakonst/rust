@@ -1137,7 +1137,9 @@ impl CommandLineStep for Rustc {
             cargo.arg("-p").arg(krate);
         }
 
-        if builder.sess.config.enable_bolt_settings && build_compiler.stage == 1 {
+        if builder.sess.config.enable_bolt_settings
+            && builder::is_final_compiler_build(builder, build_compiler)
+        {
             // Relocations are required for BOLT to work.
             cargo.env("RUSTC_BOLT_LINK_FLAGS", "1");
         }

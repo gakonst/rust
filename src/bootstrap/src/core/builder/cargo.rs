@@ -1534,8 +1534,19 @@ pub(crate) fn cargo_profile_var(name: &str, config: &Config, mode: Mode) -> Stri
     format!("CARGO_PROFILE_{profile}_{name}")
 }
 
+/// Returns true if `build_compiler` is building the *final* compiler of this invocation,
+/// i.e. the one PGO/BOLT settings should apply to.
+///
+/// For the usual `dist` flow (`--stage 2`) this is the stage1 compiler building the stage2
+/// compiler (as before). For `--stage 1` builds this is the stage0 (beta) compiler building
+/// the stage1 compiler, which makes it possible to produce a PGO/BOLT optimized compiler
+/// without paying for a full stage2 build.
+pub(crate) fn is_final_compiler_build(builder: &Builder<'_>, build_compiler: Compiler) -> bool {
+    build_compiler.stage + 1 == builder.top_stage.max(1)
+}
+
 /// Applies PGO compile flags to the given Cargo invocation based on the given PGO config.
-/// PGO flags are only applied when compiling a stage2 component.
+/// PGO flags are only applied when compiling the final compiler (see `is_final_compiler_build`).
 pub(crate) fn apply_pgo(
     builder: &Builder<'_>,
     cargo: &mut Cargo,
@@ -1543,7 +1554,7 @@ pub(crate) fn apply_pgo(
     config: &PgoConfig,
 ) {
     let is_collecting = if let Some(path) = &config.generate_profile {
-        if build_compiler.stage == 1 {
+        if is_final_compiler_build(builder, build_compiler) {
             cargo
                 .rustflag(&format!("-Cprofile-generate={}", path.to_str().expect("non-UTF8 path")));
             // Apparently necessary to avoid overflowing the counters during
@@ -1554,7 +1565,7 @@ pub(crate) fn apply_pgo(
             false
         }
     } else if let Some(path) = &config.use_profile {
-        if build_compiler.stage == 1 {
+        if is_final_compiler_build(builder, build_compiler) {
             cargo.rustflag(&format!("-Cprofile-use={}", path.to_str().expect("non-UTF8 path")));
             if builder.is_verbose() {
                 cargo.rustflag("-Cllvm-args=-pgo-warn-missing-function");
