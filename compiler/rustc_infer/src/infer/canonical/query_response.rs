@@ -196,7 +196,6 @@ impl<'tcx> InferCtxt<'tcx> {
         if split_type_outlives {
             region_constraints.constraints =
                 self.split_type_outlives_constraints(region_constraints.constraints);
-            self.remove_trivial_region_constraints(&mut region_constraints);
         }
         debug!(?region_constraints);
 
@@ -215,38 +214,6 @@ impl<'tcx> InferCtxt<'tcx> {
             value: answer,
             opaque_types,
         })
-    }
-
-    /// Drops region constraints which are trivially true once their region variables are
-    /// (shallowly) resolved, i.e. `'a: 'a` and `'a == 'a`. Only used for the borrowck type op
-    /// responses, whose consumer (`ConstraintConversion`) ignores such constraints anyway.
-    ///
-    /// The canonicalizer resolves region variables the same way, so these constraints would
-    /// show up as `'^0: '^0` in the canonical response. Each placeholder mentioned only by
-    /// such constraints becomes a canonical variable, i.e. a fresh universe and placeholder
-    /// every time borrowck instantiates the response. With the next trait solver,
-    /// higher-ranked where-clauses produce very many of them.
-    fn remove_trivial_region_constraints(
-        &self,
-        region_constraints: &mut QueryRegionConstraints<'tcx>,
-    ) {
-        if region_constraints.constraints.is_empty() {
-            return;
-        }
-        let tcx = self.tcx;
-        let mut inner = self.inner.borrow_mut();
-        let mut rc = inner.unwrap_region_constraints();
-        let mut resolve = |r: ty::Region<'tcx>| match r.kind() {
-            ty::ReVar(vid) => rc.shallow_resolve_region_var(tcx, vid),
-            _ => r,
-        };
-        region_constraints.constraints.retain(|c| match c.constraint {
-            ty::RegionConstraint::Outlives(outlives) => match outlives.0.kind() {
-                GenericArgKind::Lifetime(r1) => resolve(r1) != resolve(outlives.1),
-                GenericArgKind::Type(_) | GenericArgKind::Const(_) => true,
-            },
-            ty::RegionConstraint::Eq(eq) => resolve(eq.0) != resolve(eq.1),
-        });
     }
 
     /// Replaces each `T: 'r` constraint by the constraints `ConstraintConversion` would derive
