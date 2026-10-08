@@ -15,7 +15,7 @@ use rustc_middle::mir::interpret::ReportedErrorInfo;
 use rustc_middle::query::TyCtxtAt;
 use rustc_middle::ty::consts::ConstExt;
 use rustc_middle::ty::layout::{HasTyCtxt, HasTypingEnv, TyAndLayout, ValidityRequirement};
-use rustc_middle::ty::{self, FieldInfo, ScalarInt, Ty, TyCtxt};
+use rustc_middle::ty::{self, FieldInfo, ScalarInt, Ty, TyCtxt, TypeVisitableExt};
 use rustc_middle::{mir, throw_machine_stop};
 use rustc_span::{Span, Symbol, bug, span_bug, sym};
 use rustc_target::callconv::FnAbi;
@@ -74,6 +74,18 @@ pub struct CompileTimeMachine<'tcx> {
 
     /// The current retag mode.
     retag_mode: RetagMode,
+
+    /// Lazily computed cost of interpreting `<[T]>::len` (see
+    /// [`InterpCx::try_eval_slice_len_fast`]): `Some(None)` if the fast path is not applicable.
+    slice_len_cost: Option<Option<SliceLenCost>>,
+}
+
+/// What interpreting the body of `<[T]>::len` would cost: the number of `ConstEvalCounter`
+/// steps it executes and the maximal number of stack frames it pushes (including its own).
+#[derive(Copy, Clone)]
+struct SliceLenCost {
+    steps: usize,
+    frames: usize,
 }
 
 #[derive(Copy, Clone)]
@@ -110,8 +122,73 @@ impl<'tcx> CompileTimeMachine<'tcx> {
             static_root_ids: None,
             union_data_ranges: FxHashMap::default(),
             retag_mode: RetagMode::Default,
+            slice_len_cost: None,
         }
     }
+}
+
+/// Computes how many `ConstEvalCounter` steps and nested stack frames interpreting the CTFE MIR of
+/// `def_id` takes, provided that body is straight-line code consisting only of storage markers,
+/// counters, infallible pointer copies/casts/metadata reads of locals, and calls to functions of
+/// the same shape. Returns `None` for anything else.
+fn straight_line_ctfe_cost<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: DefId,
+    depth: usize,
+) -> Option<SliceLenCost> {
+    use mir::{Operand, ProjectionElem, Rvalue, StatementKind, TerminatorKind};
+    if depth > 4 || !tcx.is_const_fn(def_id) || tcx.intrinsic(def_id).is_some() {
+        return None;
+    }
+    let body = tcx.mir_for_ctfe(def_id);
+    let is_local = |p: &mir::Place<'tcx>| p.projection.is_empty();
+    let is_local_op = |op: &Operand<'tcx>| match op {
+        Operand::Copy(p) | Operand::Move(p) => is_local(p),
+        _ => false,
+    };
+    let mut cost = SliceLenCost { steps: 0, frames: 1 };
+    let mut bb = mir::START_BLOCK;
+    for _ in 0..=body.basic_blocks.len() {
+        let data = &body.basic_blocks[bb];
+        for stmt in &data.statements {
+            match &stmt.kind {
+                StatementKind::ConstEvalCounter => cost.steps += 1,
+                StatementKind::StorageLive(_)
+                | StatementKind::StorageDead(_)
+                | StatementKind::Nop => {}
+                StatementKind::Assign(assign) => {
+                    let (place, rvalue) = &**assign;
+                    if !is_local(place) {
+                        return None;
+                    }
+                    match rvalue {
+                        Rvalue::Use(op, _) if is_local_op(op) => {}
+                        Rvalue::UnaryOp(mir::UnOp::PtrMetadata, op) if is_local_op(op) => {}
+                        Rvalue::Cast(mir::CastKind::PtrToPtr, op, _) if is_local_op(op) => {}
+                        Rvalue::RawPtr(_, p)
+                            if p.projection.as_slice() == [ProjectionElem::Deref] => {}
+                        _ => return None,
+                    }
+                }
+                _ => return None,
+            }
+        }
+        match &data.terminator().kind {
+            TerminatorKind::Return => return Some(cost),
+            TerminatorKind::Goto { target } => bb = *target,
+            TerminatorKind::Call { func, args, target: Some(target), .. }
+                if args.iter().all(|arg| is_local_op(&arg.node)) =>
+            {
+                let (callee, _) = func.const_fn_def()?;
+                let callee_cost = straight_line_ctfe_cost(tcx, callee, depth + 1)?;
+                cost.steps += callee_cost.steps;
+                cost.frames = cost.frames.max(1 + callee_cost.frames);
+                bb = *target;
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 impl<K: Hash + Eq, V> interpret::AllocMap<K, V> for FxIndexMap<K, V> {
@@ -235,10 +312,17 @@ impl<'tcx> CompileTimeInterpCx<'tcx> {
         &mut self,
         instance: ty::Instance<'tcx>,
         args: &[FnArg<'tcx>],
-        _dest: &PlaceTy<'tcx>,
-        _ret: Option<mir::BasicBlock>,
+        dest: &PlaceTy<'tcx>,
+        ret: Option<mir::BasicBlock>,
     ) -> InterpResult<'tcx, Option<ty::Instance<'tcx>>> {
         let def_id = instance.def_id();
+
+        if self.tcx.is_lang_item(def_id, LangItem::SliceLen)
+            && self.try_eval_slice_len_fast(instance, args, dest, ret)?
+        {
+            // Call has already been handled.
+            return interp_ok(None);
+        }
 
         if self.tcx.is_lang_item(def_id, LangItem::PanicDisplay)
             || self.tcx.is_lang_item(def_id, LangItem::BeginPanic)
@@ -270,6 +354,62 @@ impl<'tcx> CompileTimeInterpCx<'tcx> {
             return interp_ok(Some(new_instance));
         }
         interp_ok(Some(instance))
+    }
+
+    /// Evaluates a call of `<[T]>::len` directly as `PtrMetadata` of its argument, which is what
+    /// its body (`ptr::metadata(self)`) computes, instead of pushing two interpreter frames. Hex
+    /// literal decoding (`hex!`/`bytes!`) calls it for every input character.
+    ///
+    /// The fast path is only taken when it is observably equivalent to interpreting the body: the
+    /// argument is an initialized, copied `&[T]`, interpreting the body could not hit the stack
+    /// limit nor reach a step-limit lint/progress threshold, and extra UB checks are off. The step
+    /// counter is advanced by exactly as many steps as the body would have executed.
+    fn try_eval_slice_len_fast(
+        &mut self,
+        instance: ty::Instance<'tcx>,
+        args: &[FnArg<'tcx>],
+        dest: &PlaceTy<'tcx>,
+        ret: Option<mir::BasicBlock>,
+    ) -> InterpResult<'tcx, bool> {
+        let (Some(ret), [FnArg::Copy(arg)]) = (ret, args) else { return interp_ok(false) };
+        if self.tcx.sess.opts.unstable_opts.extra_const_ub_checks
+            || !matches!(instance.def, ty::InstanceKind::Item(_))
+            || instance.args.has_param()
+            || dest.layout.ty != self.tcx.types.usize
+            || !matches!(arg.layout.ty.kind(), ty::Ref(_, pointee, _) if pointee.is_slice())
+        {
+            return interp_ok(false);
+        }
+        let cost = match self.machine.slice_len_cost {
+            Some(cost) => cost,
+            None => {
+                let cost = straight_line_ctfe_cost(*self.tcx, instance.def_id(), 0);
+                self.machine.slice_len_cost = Some(cost);
+                cost
+            }
+        };
+        let Some(cost) = cost else { return interp_ok(false) };
+        if !self.recursion_limit.value_within_limit(self.stack().len() + cost.frames) {
+            return interp_ok(false);
+        }
+        let limit = if self.tcx.sess.opts.unstable_opts.tiny_const_eval_limit {
+            TINY_LINT_TERMINATOR_LIMIT
+        } else {
+            LINT_TERMINATOR_LIMIT.min(PROGRESS_INDICATOR_START)
+        };
+        let Some(new_steps) = self.machine.num_evaluated_steps.checked_add(cost.steps) else {
+            return interp_ok(false);
+        };
+        if new_steps >= limit {
+            return interp_ok(false);
+        }
+        // Reading an uninitialized argument would raise the error inside the callee frame.
+        let Some(imm) = self.read_immediate(arg).discard_err() else { return interp_ok(false) };
+        let len = self.unary_op(mir::UnOp::PtrMetadata, &imm)?;
+        self.write_immediate(*len, dest)?;
+        self.machine.num_evaluated_steps = new_steps;
+        self.return_to_block(Some(ret))?;
+        interp_ok(true)
     }
 
     /// See documentation on the `ptr_guaranteed_cmp` intrinsic.
