@@ -776,7 +776,13 @@ fn lower_to_hir(tcx: TyCtxt<'_>, def_id: LocalDefId) -> hir::MaybeOwner<'_> {
         }),
     };
 
-    tcx.sess.time("drop_ast", || mem::drop(node));
+    // Dropping the AST of large owners can be expensive. With multiple threads, free it on
+    // another one: nothing observes when this happens.
+    let prof = tcx.sess.prof.clone();
+    rustc_data_structures::sync::spawn(move || {
+        let _timer = prof.generic_activity("drop_ast");
+        mem::drop(node)
+    });
 
     item
 }
