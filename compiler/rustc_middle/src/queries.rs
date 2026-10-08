@@ -2520,6 +2520,25 @@ rustc_queries! {
     /// Do not call this query directly: Invoke `normalize` instead.
     ///
     /// </div>
+    ///
+    /// Same as `normalize_canonicalized_projection`, but for callers whose inference context
+    /// ignores regions in codegen (e.g. `normalize_erasing_regions`): all region constraints
+    /// are discarded by such callers anyway, so the nested obligations are proven ignoring
+    /// regions as well, which lets them use the evaluation cache.
+    query normalize_canonicalized_projection_ignoring_regions(
+        goal: CanonicalAliasGoal<'tcx>
+    ) -> Result<
+        &'tcx Canonical<'tcx, canonical::QueryResponse<'tcx, NormalizationResult<'tcx>>>,
+        NoSolution,
+    > {
+        desc { "normalizing `{}` ignoring regions", goal.canonical.value.value }
+    }
+
+    /// <div class="warning">
+    ///
+    /// Do not call this query directly: Invoke `normalize` instead.
+    ///
+    /// </div>
     query normalize_canonicalized_free_alias(
         goal: CanonicalAliasGoal<'tcx>
     ) -> Result<
