@@ -1829,8 +1829,13 @@ fn effective_visibilities(tcx: TyCtxt<'_>, (): ()) -> &EffectiveVisibilities {
         // When the parallel frontend is enabled, compute the hidden types in parallel up
         // front, so that the sequential walk only hits the query cache. With a single thread
         // nothing changes, which keeps diagnostic order deterministic.
+        // The largest defining bodies are started first, so they don't end up dominating the
+        // wall time by being started last.
         if sync::is_dyn_thread_safe() {
-            sync::par_for_each_in(&opaques_to_visit, |&&id| {
+            let mut largest_first = opaques_to_visit.clone();
+            largest_first
+                .sort_by_cached_key(|&id| std::cmp::Reverse(tcx.estimated_hir_owner_size(id)));
+            sync::par_for_each_in_order(&largest_first, |&id| {
                 tcx.ensure_ok().type_of(id);
             });
         }

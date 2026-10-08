@@ -1154,7 +1154,7 @@ fn run_required_analyses(tcx: TyCtxt<'_>) {
     tcx.untracked().definitions.freeze();
 
     sess.time("MIR_borrow_checking", || {
-        tcx.par_hir_body_owners(|def_id| {
+        tcx.par_hir_body_owners_largest_first(|def_id| {
             let not_typeck_child = !tcx.is_typeck_child(def_id.to_def_id());
             if not_typeck_child {
                 // Child unsafety and borrowck happens together with the parent

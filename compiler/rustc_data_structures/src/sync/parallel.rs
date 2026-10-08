@@ -185,6 +185,45 @@ pub fn par_for_each_in<I: DynSend, T: IntoIterator<Item = I>>(
     });
 }
 
+/// Runs `for_each` on every item of `items`, in parallel if the parallel frontend is enabled.
+///
+/// Unlike [`par_for_each_in`], which splits the items into contiguous groups, this *starts* the
+/// items in slice order: every worker repeatedly takes the next not-yet-started item. Putting the
+/// most expensive items first therefore keeps a few large items from being started last and
+/// dominating the wall time (greedy list scheduling). With a single thread, this is a sequential
+/// loop over the items in order.
+pub fn par_for_each_in_order<I: DynSync>(items: &[I], for_each: impl Fn(&I) + DynSync + DynSend) {
+    parallel_guard(|guard| {
+        if let Some(proof) = mode::check_dyn_thread_safe()
+            && items.len() > 1
+        {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            let next = AtomicUsize::new(0);
+            let items = proof.derive(items);
+            let for_each = proof.derive(for_each);
+            let worker = || {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(i) else { break };
+                    guard.run(|| for_each(item));
+                }
+            };
+            let workers = rustc_thread_pool::current_num_threads().min(items.len());
+            rustc_thread_pool::scope(|s| {
+                for _ in 1..workers {
+                    s.spawn(|_| worker());
+                }
+                worker();
+            });
+        } else {
+            items.iter().for_each(|item| {
+                guard.run(|| for_each(item));
+            });
+        }
+    });
+}
+
 // FIXME: actually make parallel and `T: DynSend`
 pub fn par_for_each_slice<T>(items: &mut [T], for_each: impl Fn(&mut T)) {
     parallel_guard(|guard| {

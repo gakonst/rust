@@ -9,7 +9,10 @@ use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::stable_hash::{StableHash, StableHasher};
 use rustc_data_structures::steal::Steal;
 use rustc_data_structures::svh::Svh;
-use rustc_data_structures::sync::{DynSend, DynSync, par_for_each_in, try_par_for_each_in};
+use rustc_data_structures::sync::{
+    DynSend, DynSync, is_dyn_thread_safe, par_for_each_in, par_for_each_in_order,
+    try_par_for_each_in,
+};
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{DefId, LocalDefId, LocalModId};
 use rustc_hir::definitions::{DefKey, DefPath, DefPathHash};
@@ -376,6 +379,30 @@ impl<'tcx> TyCtxt<'tcx> {
     #[inline]
     pub fn par_hir_body_owners(self, f: impl Fn(LocalDefId) + DynSend + DynSync) {
         par_for_each_in(&self.hir_crate_items(()).body_owners[..], |&&def_id| f(def_id));
+    }
+
+    /// Like [`TyCtxt::par_hir_body_owners`], but when running on multiple threads, the bodies of
+    /// the largest owners (by number of HIR nodes) are started first. This avoids a few huge
+    /// bodies being started last and dominating the wall time of expensive per-body passes such
+    /// as borrow checking. With a single thread the order is the same as `par_hir_body_owners`.
+    pub fn par_hir_body_owners_largest_first(self, f: impl Fn(LocalDefId) + DynSend + DynSync) {
+        if !is_dyn_thread_safe() {
+            return self.par_hir_body_owners(f);
+        }
+        let mut body_owners = self.hir_crate_items(()).body_owners.to_vec();
+        body_owners
+            .sort_by_cached_key(|&def_id| std::cmp::Reverse(self.estimated_hir_owner_size(def_id)));
+        par_for_each_in_order(&body_owners, |&def_id| f(def_id));
+    }
+
+    /// A cheap estimate of how expensive the item owning `def_id` is to analyze: the number of
+    /// HIR nodes of its owner (including nested bodies such as closures and `async` blocks).
+    /// This is only meant to be used for scheduling and does not record a dependency.
+    pub fn estimated_hir_owner_size(self, def_id: LocalDefId) -> usize {
+        self.dep_graph.with_ignore(|| {
+            let owner = self.local_def_id_to_hir_id(def_id).owner;
+            self.hir_owner_nodes(owner).nodes.len()
+        })
     }
 
     pub fn hir_ty_param_owner(self, def_id: LocalDefId) -> LocalDefId {
