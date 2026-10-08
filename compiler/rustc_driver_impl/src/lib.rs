@@ -334,13 +334,16 @@ pub fn compiler_entrypoint(at_args: &[String], callbacks: &mut (dyn Callbacks + 
                 }
             }
 
-            let linker = Linker::codegen_and_build_linker(tcx, codegen_backend);
+            let mut linker = Linker::codegen_and_build_linker(tcx, codegen_backend);
 
             if let Some(metrics_dir) = &sess.opts.unstable_opts.metrics_dir {
                 dump_feature_usage_metrics(tcx, metrics_dir);
             }
 
             tcx.report_unused_features();
+
+            // This may call `tcx.finish()`, so no queries must be run after it.
+            linker.finish_and_write_rlib(tcx, codegen_backend);
 
             Some(linker)
         });

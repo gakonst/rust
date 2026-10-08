@@ -12,6 +12,7 @@ use std::ffi::OsStr;
 use std::hash::{Hash, Hasher};
 use std::marker::PointeeSized;
 use std::ops::Deref;
+use std::sync::atomic::{self, AtomicBool};
 use std::sync::{Arc, OnceLock};
 use std::{debug_assert_matches, fmt, iter, mem};
 
@@ -784,6 +785,9 @@ pub struct GlobalCtxt<'tcx> {
     pub(crate) alloc_map: interpret::AllocMap<'tcx>,
 
     current_gcx: CurrentGcx,
+
+    /// Whether [`TyCtxt::finish`] has already run.
+    finished: AtomicBool,
 }
 
 impl<'tcx> GlobalCtxt<'tcx> {
@@ -985,6 +989,7 @@ impl<'tcx> TyCtxt<'tcx> {
             data_layout,
             alloc_map: interpret::AllocMap::new(),
             current_gcx,
+            finished: AtomicBool::new(false),
         });
 
         // This is a separate function to work around a crash with parallel rustc (#135870)
@@ -1610,7 +1615,13 @@ impl<'tcx> TyCtxt<'tcx> {
         self.hir_expect_opaque_ty(def_id).origin
     }
 
+    /// Saves the incremental compilation state. This must be the last use of the `TyCtxt`; it
+    /// does nothing if it has already been called.
     pub fn finish(self) {
+        if self.finished.swap(true, atomic::Ordering::Relaxed) {
+            return;
+        }
+
         // We assume that no queries are run past here. If there are new queries
         // after this point, they'll show up as "<unknown>" in self-profiling data.
         self.alloc_self_profile_query_strings();
