@@ -209,6 +209,9 @@ fn place_mono_items<'tcx, I>(cx: &PartitioningCx<'_, 'tcx>, mono_items: I) -> Pl
 where
     I: Iterator<Item = MonoItem<'tcx>>,
 {
+    // Optional fixed per-item cost (-Zcgu-item-overhead): MIR-size estimates under-weight CGUs made
+    // of many tiny functions (task harnesses, drop glue), whose LLVM cost is dominated by per-function work.
+    let item_overhead = cx.tcx.sess.opts.unstable_opts.cgu_item_overhead;
     let mut codegen_units = UnordMap::default();
     let is_incremental_build = cx.tcx.sess.opts.incremental.is_some();
     let mut internalization_candidates = UnordSet::default();
@@ -261,7 +264,7 @@ where
         if visibility == Visibility::Hidden && can_be_internalized {
             internalization_candidates.insert(mono_item);
         }
-        let size_estimate = mono_item.size_estimate(cx.tcx);
+        let size_estimate = mono_item.size_estimate(cx.tcx) + item_overhead;
 
         cgu.items_mut()
             .insert(mono_item, MonoItemData { inlined: false, linkage, visibility, size_estimate });
@@ -282,7 +285,7 @@ where
                 inlined: true,
                 linkage: Linkage::Internal,
                 visibility: Visibility::Default,
-                size_estimate: inlined_item.size_estimate(cx.tcx),
+                size_estimate: inlined_item.size_estimate(cx.tcx) + item_overhead,
             });
         }
     }
