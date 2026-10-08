@@ -102,7 +102,7 @@ use rustc_attr_ir::lang_items::LangItem;
 use rustc_attr_ir::{InlineAttr, Linkage};
 use rustc_data_structures::either::Either;
 use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
-use rustc_data_structures::sync::par_join;
+use rustc_data_structures::sync::{par_join, par_map};
 use rustc_data_structures::unord::{UnordMap, UnordSet};
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, DefIdSet, LOCAL_CRATE};
@@ -1143,8 +1143,12 @@ where
 {
     let _prof_timer = tcx.prof.generic_activity("assert_symbols_are_distinct");
 
+    // Computing the symbol names is the expensive part (it also fills the `symbol_name` query
+    // cache used by codegen), so do it in parallel with the parallel frontend. `par_map`
+    // preserves the order of the items.
+    let mono_items: Vec<&'a MonoItem<'tcx>> = mono_items.collect();
     let mut symbols: Vec<_> =
-        mono_items.map(|mono_item| (mono_item, mono_item.symbol_name(tcx))).collect();
+        par_map(mono_items, |mono_item| (mono_item, mono_item.symbol_name(tcx)));
 
     symbols.sort_by_key(|sym| sym.1);
 
