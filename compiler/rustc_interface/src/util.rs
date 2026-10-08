@@ -251,11 +251,13 @@ pub(crate) fn run_in_thread_pool_with_globals<F: FnOnce(CurrentGcx) -> R + Send,
 
     let proxy = Proxy::new();
     let proxy_ = Arc::clone(&proxy);
+    let proxy__ = Arc::clone(&proxy);
 
     let builder = rustc_thread_pool::ThreadPoolBuilder::new()
         .thread_name(|_| "rustc".to_string())
         .acquire_thread_handler(move || proxy.acquire_thread())
         .release_thread_handler(move || proxy_.release_thread())
+        .yield_thread_handler(move || proxy__.yield_thread())
         .num_threads(jobs_frontend.get())
         .deadlock_handler(move || {
             // On deadlock, creates a new thread and forwards information in thread

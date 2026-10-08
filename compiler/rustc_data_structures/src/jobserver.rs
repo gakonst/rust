@@ -113,6 +113,9 @@ pub struct Proxy {
 /// How often a thread waiting for a token checks whether the jobserver has spare tokens.
 const SPARE_TOKEN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// How long a yielding thread waits before trying to re-acquire the token it gave back.
+const YIELD_GRACE_PERIOD: Duration = Duration::from_millis(1);
+
 impl Proxy {
     pub fn new() -> Arc<Self> {
         let proxy = Arc::new(Proxy {
@@ -192,6 +195,28 @@ impl Proxy {
                 self.wake_pending.wait_for(&mut data, SPARE_TOKEN_POLL_INTERVAL);
             }
         }
+    }
+
+    /// Called periodically by busy threads holding a token. If this process holds extra tokens
+    /// while the jobserver has none to spare, other processes (e.g. Cargo wanting to start a job, or
+    /// a build script compiling C code that may be on the critical path) may be waiting for one.
+    /// Then give this thread's token back to the jobserver for a moment and re-acquire it with low
+    /// priority, so that a waiting process gets the token first. Never yields the last token of
+    /// the process.
+    pub fn yield_thread(&self) {
+        let mut data = self.data.lock();
+        if data.used <= 1 || data.pending > 0 || self.has_spare_token() {
+            return;
+        }
+        data.used -= 1;
+        drop(data);
+        if self.client.release_raw().is_err() {
+            self.data.lock().used += 1;
+            return;
+        }
+        // Give a process blocked on the jobserver the chance to pick the token up first.
+        std::thread::sleep(YIELD_GRACE_PERIOD);
+        self.acquire_thread();
     }
 
     /// Releases a token, possibly immediately giving it to some other thread as an optimization.

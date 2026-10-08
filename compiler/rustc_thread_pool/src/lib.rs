@@ -200,6 +200,10 @@ pub struct ThreadPoolBuilder<S = DefaultSpawn> {
     /// Closure invoked when blocking in a thread.
     release_thread_handler: Option<Box<ReleaseThreadHandler>>,
 
+    /// Closure periodically invoked by busy worker threads between jobs, giving the embedder a
+    /// chance to temporarily hand the thread's resources (e.g. a jobserver token) to others.
+    yield_thread_handler: Option<Box<YieldThreadHandler>>,
+
     /// If false, worker threads will execute spawned jobs in a
     /// "depth-first" fashion. If true, they will do a "breadth-first"
     /// fashion. Depth-first is the default.
@@ -245,6 +249,7 @@ impl Default for ThreadPoolBuilder {
             deadlock_handler: None,
             acquire_thread_handler: None,
             release_thread_handler: None,
+            yield_thread_handler: None,
             spawn_handler: DefaultSpawn,
             breadth_first: false,
         }
@@ -258,6 +263,10 @@ type AcquireThreadHandler = dyn Fn() + Send + Sync;
 /// The type for a closure that gets invoked before blocking in a thread.
 /// Note that this same closure may be invoked multiple times in parallel.
 type ReleaseThreadHandler = dyn Fn() + Send + Sync;
+
+/// The type for a closure that busy worker threads invoke periodically between jobs.
+/// Note that this same closure may be invoked multiple times in parallel.
+type YieldThreadHandler = dyn Fn() + Send + Sync;
 
 impl ThreadPoolBuilder {
     /// Creates and returns a valid rayon thread pool builder, but does not initialize it.
@@ -471,6 +480,7 @@ impl<S> ThreadPoolBuilder<S> {
             deadlock_handler: self.deadlock_handler,
             acquire_thread_handler: self.acquire_thread_handler,
             release_thread_handler: self.release_thread_handler,
+            yield_thread_handler: self.yield_thread_handler,
             breadth_first: self.breadth_first,
         }
     }
@@ -652,6 +662,21 @@ impl<S> ThreadPoolBuilder<S> {
         self
     }
 
+    /// Takes the current yield thread callback, leaving `None`.
+    fn take_yield_thread_handler(&mut self) -> Option<Box<YieldThreadHandler>> {
+        self.yield_thread_handler.take()
+    }
+
+    /// Set a callback that busy worker threads invoke periodically (at most every few
+    /// milliseconds) between jobs. It may block, e.g. to temporarily give a jobserver token back.
+    pub fn yield_thread_handler<H>(mut self, yield_thread_handler: H) -> Self
+    where
+        H: Fn() + Send + Sync + 'static,
+    {
+        self.yield_thread_handler = Some(Box::new(yield_thread_handler));
+        self
+    }
+
     /// Takes the current deadlock callback, leaving `None`.
     fn take_deadlock_handler(&mut self) -> Option<Box<DeadlockHandler>> {
         self.deadlock_handler.take()
@@ -826,6 +851,7 @@ impl<S> fmt::Debug for ThreadPoolBuilder<S> {
             ref exit_handler,
             ref acquire_thread_handler,
             ref release_thread_handler,
+            ref yield_thread_handler,
             spawn_handler: _,
             ref breadth_first,
         } = *self;
@@ -845,6 +871,7 @@ impl<S> fmt::Debug for ThreadPoolBuilder<S> {
         let exit_handler = exit_handler.as_ref().map(|_| ClosurePlaceholder);
         let acquire_thread_handler = acquire_thread_handler.as_ref().map(|_| ClosurePlaceholder);
         let release_thread_handler = release_thread_handler.as_ref().map(|_| ClosurePlaceholder);
+        let yield_thread_handler = yield_thread_handler.as_ref().map(|_| ClosurePlaceholder);
 
         f.debug_struct("ThreadPoolBuilder")
             .field("num_threads", num_threads)
@@ -856,6 +883,7 @@ impl<S> fmt::Debug for ThreadPoolBuilder<S> {
             .field("exit_handler", &exit_handler)
             .field("acquire_thread_handler", &acquire_thread_handler)
             .field("release_thread_handler", &release_thread_handler)
+            .field("yield_thread_handler", &yield_thread_handler)
             .field("breadth_first", &breadth_first)
             .finish()
     }
