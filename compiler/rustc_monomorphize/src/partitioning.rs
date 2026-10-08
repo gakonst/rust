@@ -101,7 +101,7 @@ use std::path::{Path, PathBuf};
 use rustc_attr_ir::lang_items::LangItem;
 use rustc_attr_ir::{InlineAttr, Linkage, find_attr};
 use rustc_data_structures::either::Either;
-use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
+use rustc_data_structures::fx::{FxIndexMap, FxIndexSet, IndexEntry};
 use rustc_data_structures::sync::{par_join, par_map};
 use rustc_data_structures::unord::{UnordMap, UnordSet};
 use rustc_hir::def::DefKind;
@@ -162,6 +162,13 @@ where
 
         placed
     };
+
+    // Split CGUs that are much bigger than an even share of the crate.
+    {
+        let _prof_timer = tcx.prof.generic_activity("cgu_partitioning_split_cgus");
+        split_oversized_codegen_units(cx, &mut codegen_units);
+        debug_dump(tcx, "SPLIT", &codegen_units);
+    }
 
     // Merge until we don't exceed the max CGU count.
     // `merge_codegen_units` is responsible for updating the CGU size
@@ -296,20 +303,108 @@ where
     }
 
     return PlacedMonoItems { codegen_units, internalization_candidates };
+}
 
-    fn get_reachable_inlined_items<'tcx>(
-        tcx: TyCtxt<'tcx>,
-        item: MonoItem<'tcx>,
-        usage_map: &UsageMap<'tcx>,
-        visited: &mut FxIndexSet<MonoItem<'tcx>>,
-    ) {
-        usage_map.for_each_inlined_used_item(tcx, item, |inlined_item| {
-            let is_new = visited.insert(inlined_item);
-            if is_new {
-                get_reachable_inlined_items(tcx, inlined_item, usage_map, visited);
-            }
-        });
+/// Collects all inlined (`LocalCopy`) items reachable from `item` without going via another root
+/// item.
+fn get_reachable_inlined_items<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    item: MonoItem<'tcx>,
+    usage_map: &UsageMap<'tcx>,
+    visited: &mut FxIndexSet<MonoItem<'tcx>>,
+) {
+    usage_map.for_each_inlined_used_item(tcx, item, |inlined_item| {
+        let is_new = visited.insert(inlined_item);
+        if is_new {
+            get_reachable_inlined_items(tcx, inlined_item, usage_map, visited);
+        }
+    });
+}
+
+/// Unless overridden by `-Zsplit-cgu-size`, initial CGUs smaller than this are never split.
+const MIN_SPLIT_CGU_SIZE: usize = 100_000;
+
+/// In non-incremental builds, splits initial (per-source-module) CGUs that are much bigger than an
+/// even share of the crate into several CGUs of about that share.
+///
+/// Initial CGUs correspond to source modules (instances of upstream generic functions are placed in
+/// the CGU of the upstream module defining them), so a single module, e.g. one instantiating a
+/// generic runtime entry point with hundreds of futures, can contain a big fraction of a crate's
+/// code. Merging can only make CGUs bigger, so such a module ends up as one huge CGU whose
+/// optimization and code generation (and, with ThinLTO, its LTO backend job) is the critical path
+/// of the whole backend while the other CGUs are long done. The number of CGUs is still bounded by
+/// `-Ccodegen-units` because merging runs afterwards.
+fn split_oversized_codegen_units<'tcx>(
+    cx: &PartitioningCx<'_, 'tcx>,
+    codegen_units: &mut Vec<CodegenUnit<'tcx>>,
+) {
+    let tcx = cx.tcx;
+    let max_codegen_units = tcx.sess.codegen_units().as_usize();
+    let min_split_size = tcx.sess.opts.unstable_opts.split_cgu_size.unwrap_or(MIN_SPLIT_CGU_SIZE);
+    if tcx.sess.opts.incremental.is_some() || max_codegen_units <= 1 || min_split_size == 0 {
+        return;
     }
+
+    let total_size: usize = codegen_units.iter().map(|cgu| cgu.size_estimate()).sum();
+    // The size we split oversized CGUs into, and the size above which a CGU is oversized.
+    let target_size = cmp::max(total_size / max_codegen_units, min_split_size);
+    let oversized = target_size + target_size / 2;
+    if !codegen_units.iter().any(|cgu| cgu.size_estimate() > oversized) {
+        return;
+    }
+
+    let mut new_cgus = Vec::new();
+    for cgu in codegen_units.iter_mut() {
+        if cgu.size_estimate() <= oversized {
+            continue;
+        }
+        // Distribute the root items in a deterministic order (local items by source position,
+        // which also tends to keep related items together), each with the inlined items reachable
+        // from it, into consecutive parts of about `target_size`.
+        let roots: Vec<_> = cgu
+            .items_in_deterministic_order(tcx)
+            .into_iter()
+            .filter(|(_, data)| !data.inlined)
+            .collect();
+        let num_parts = cgu.size_estimate().div_ceil(target_size).min(roots.len());
+        if num_parts < 2 {
+            continue;
+        }
+        let part_size = cgu.size_estimate() / num_parts;
+        let name = cgu.name();
+        let old_items = std::mem::take(cgu.items_mut());
+        let mut parts = Vec::with_capacity(num_parts);
+        let mut part = CodegenUnit::new(name);
+        let mut size = 0;
+        let mut reachable = FxIndexSet::default();
+        for (root, data) in roots {
+            if size >= part_size && parts.len() + 1 < num_parts {
+                parts.push(part);
+                part = CodegenUnit::new(Symbol::intern(&format!("{name}.{}", parts.len())));
+                size = 0;
+            }
+            part.items_mut().insert(root, data);
+            size += data.size_estimate;
+            reachable.clear();
+            get_reachable_inlined_items(tcx, root, cx.usage_map, &mut reachable);
+            for &inlined_item in &reachable {
+                if let IndexEntry::Vacant(e) = part.items_mut().entry(inlined_item) {
+                    let data = old_items[&inlined_item];
+                    size += data.size_estimate;
+                    e.insert(data);
+                }
+            }
+        }
+        parts.push(part);
+        for part in &mut parts {
+            part.compute_size_estimate();
+        }
+        let mut parts = parts.into_iter();
+        *cgu = parts.next().unwrap();
+        new_cgus.extend(parts);
+    }
+    codegen_units.extend(new_cgus);
+    codegen_units.sort_by(|a, b| a.name().as_str().cmp(b.name().as_str()));
 }
 
 // This function requires the CGUs to be sorted by name on input, and ensures
