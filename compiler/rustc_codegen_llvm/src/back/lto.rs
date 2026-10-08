@@ -456,20 +456,6 @@ fn thin_lto(
             thin_modules.len(),
             symbols_below_threshold.as_ptr(),
             symbols_below_threshold.len(),
-            // For crate-graph LTO every Rust module of the final artifact is part of the index
-            // and `symbols_below_threshold` lists everything the artifact exports, so (exactly
-            // as fat LTO's internalization does) any other symbol that no other module refers to
-            // can be internalized.
-            cgcx.thin_lto_internalize
-                && cgcx.lto == config::Lto::Thin
-                && cgcx.crate_types.iter().all(|ty| {
-                    matches!(
-                        ty,
-                        rustc_structures::CrateType::Executable
-                            | rustc_structures::CrateType::Cdylib
-                            | rustc_structures::CrateType::StaticLib
-                    )
-                }),
         )
         .unwrap_or_else(|| write::llvm_err(dcx, LlvmError::PrepareThinLtoContext));
 
