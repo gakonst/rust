@@ -680,6 +680,20 @@ impl<'a> ArArchiveBuilder<'a> {
             })
         }
 
+        // See `update_archive_in_place`. Only done for incremental builds, where the archive is
+        // often unchanged; elsewhere the comparison would rarely pay off.
+        #[cfg(unix)]
+        if self.sess.opts.incremental.is_some()
+            && update_archive_in_place(
+                output,
+                &entries,
+                archive_kind,
+                Some(self.sess.target.arch == Arch::Arm64EC),
+            )
+        {
+            return Ok(!entries.is_empty());
+        }
+
         // Write to a temporary file first before atomically renaming to the final name.
         // This prevents programs (including rustc) from attempting to read a partial archive.
         // It also enables writing an archive with the same filename as a dependency on Windows as
@@ -723,6 +737,182 @@ impl<'a> ArArchiveBuilder<'a> {
 
         Ok(any_entries)
     }
+}
+
+/// The largest window of the existing archive that [`ArchiveDiff`] reads at once.
+#[cfg(unix)]
+const ARCHIVE_DIFF_WINDOW: usize = 1 << 20;
+
+/// A sink for `write_archive_to_stream` that, instead of writing, compares the archive with the
+/// existing file `old` and records the byte ranges that differ.
+#[cfg(unix)]
+struct ArchiveDiff<'f> {
+    old: &'f File,
+    old_len: u64,
+    /// The position in the archive being written.
+    pos: u64,
+    /// `window` holds the bytes of `old` starting at `window_start`.
+    window_start: u64,
+    window: Vec<u8>,
+    /// `(offset, new bytes)` of every differing range, in increasing offset order.
+    patches: Vec<(u64, Vec<u8>)>,
+    patch_bytes: u64,
+    max_patch_bytes: u64,
+}
+
+#[cfg(unix)]
+impl ArchiveDiff<'_> {
+    fn give_up() -> io::Error {
+        io::Error::other("archive differs too much from the existing file")
+    }
+
+    fn compare(&mut self, mut data: &[u8]) -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+
+        while !data.is_empty() {
+            let window_end = self.window_start + self.window.len() as u64;
+            if self.pos == window_end {
+                let len = (self.old_len - self.pos).min(ARCHIVE_DIFF_WINDOW as u64) as usize;
+                if len == 0 {
+                    // The new archive is longer than the existing one.
+                    return Err(Self::give_up());
+                }
+                self.window.resize(len, 0);
+                self.old.read_exact_at(&mut self.window, self.pos)?;
+                self.window_start = self.pos;
+            }
+            let offset = (self.pos - self.window_start) as usize;
+            let n = data.len().min(self.window.len() - offset);
+            let (old, new) = (&self.window[offset..offset + n], &data[..n]);
+            if old != new {
+                let first = old.iter().zip(new).position(|(a, b)| a != b).unwrap();
+                let last = old.iter().zip(new).rposition(|(a, b)| a != b).unwrap();
+                let bytes = &new[first..=last];
+                self.patch_bytes += bytes.len() as u64;
+                if self.patch_bytes > self.max_patch_bytes {
+                    return Err(Self::give_up());
+                }
+                let at = self.pos + first as u64;
+                match self.patches.last_mut() {
+                    Some((start, prev)) if *start + prev.len() as u64 == at => {
+                        prev.extend_from_slice(bytes)
+                    }
+                    _ => self.patches.push((at, bytes.to_vec())),
+                }
+            }
+            self.pos += n as u64;
+            data = &data[n..];
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Write for ArchiveDiff<'_> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.compare(data)?;
+        Ok(data.len())
+    }
+
+    fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+        self.compare(data)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl io::Seek for ArchiveDiff<'_> {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        match pos {
+            io::SeekFrom::Current(0) => Ok(self.pos),
+            _ => Err(io::Error::new(io::ErrorKind::Unsupported, "ArchiveDiff only supports tell")),
+        }
+    }
+}
+
+/// Tries to turn the existing archive at `output` into the archive described by `entries` by
+/// patching only the bytes that differ, instead of writing a complete new file.
+///
+/// In incremental builds the archive is often (nearly) identical to the previous one, e.g. when
+/// every codegen unit was reused and only a few bytes of the crate metadata changed, and writing
+/// out a large rlib again (some are over a gigabyte) is a substantial part of an incremental
+/// rebuild. Every byte is compared with the existing file, so the result is exactly the archive
+/// that would otherwise have been written. Returns `false` if the archive was not updated this
+/// way, in which case the caller must write it normally (this also replaces a file that was left
+/// partially patched by an I/O error).
+///
+/// Only a regular file without other hard links is ever modified in place, so no other path
+/// (e.g. a build cache entry hard-linked to the output) can observe the change.
+#[cfg(unix)]
+fn update_archive_in_place(
+    output: &Path,
+    entries: &[NewArchiveMember<'_>],
+    kind: ArchiveKind,
+    is_ec: Option<bool>,
+) -> bool {
+    use std::os::unix::fs::{FileExt, MetadataExt};
+
+    let Ok(meta) = fs::symlink_metadata(output) else { return false };
+    if !meta.file_type().is_file() || meta.nlink() != 1 || meta.len() == 0 {
+        return false;
+    }
+    let Ok(old) = File::open(output) else { return false };
+
+    // Cheap pre-check, so that we don't compare a lot of data only to find a difference late:
+    // the existing archive must have the same members with the same sizes.
+    {
+        let Ok(old_map) = old.try_clone().and_then(|f| unsafe { Mmap::map(f) }) else {
+            return false;
+        };
+        let Ok(old_archive) = ArchiveFile::parse(&*old_map) else { return false };
+        let mut old_members = old_archive.members();
+        for entry in entries {
+            let Some(Ok(member)) = old_members.next() else { return false };
+            let data: &[u8] = (*entry.buf).as_ref();
+            if member.name() != entry.member_name.as_bytes() || member.size() != data.len() as u64
+            {
+                return false;
+            }
+        }
+        if old_members.next().is_some() {
+            return false;
+        }
+    }
+
+    let mut diff = ArchiveDiff {
+        old: &old,
+        old_len: meta.len(),
+        pos: 0,
+        window_start: 0,
+        window: Vec::new(),
+        patches: Vec::new(),
+        patch_bytes: 0,
+        max_patch_bytes: meta.len() / 4,
+    };
+    if write_archive_to_stream(&mut diff, entries, kind, false, is_ec).is_err()
+        || diff.pos != diff.old_len
+    {
+        return false;
+    }
+    trace!(
+        "updating archive {} in place ({} ranges, {} bytes)",
+        output.display(),
+        diff.patches.len(),
+        diff.patch_bytes
+    );
+
+    let Ok(file) = fs::OpenOptions::new().write(true).open(output) else { return false };
+    for (offset, bytes) in &diff.patches {
+        if file.write_all_at(bytes, *offset).is_err() {
+            return false;
+        }
+    }
+    // Like a newly written file, the result must look newer than its inputs to mtime-based
+    // build systems, even if no byte changed.
+    file.set_modified(std::time::SystemTime::now()).is_ok()
 }
 
 fn io_error_context(context: &str, err: io::Error) -> io::Error {
