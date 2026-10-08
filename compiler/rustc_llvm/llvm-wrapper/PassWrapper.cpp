@@ -1311,7 +1311,8 @@ static const GlobalValueSummary *getFirstDefinitionForLinker(
 // function of `lib/LTO/ThinLTOCodeGenerator.cpp`.
 extern "C" LLVMRustThinLTOData *
 LLVMRustCreateThinLTOData(LLVMRustThinLTOModule *modules, size_t num_modules,
-                          const char **preserved_symbols, size_t num_symbols) {
+                          const char **preserved_symbols, size_t num_symbols,
+                          bool whole_program) {
   auto Ret = std::make_unique<LLVMRustThinLTOData>();
 
   // Load each module's summary and merge it into one combined index
@@ -1392,14 +1393,63 @@ LLVMRustCreateThinLTOData(LLVMRustThinLTOModule *modules, size_t num_modules,
   // symbols are internalized. Otherwise everything that's already external
   // linkage will stay as external, and internal will stay as internal.
   std::set<GlobalValue::GUID> ExportedGUIDs;
-  for (auto &List : Ret->Index) {
-    const auto &SummaryList = List.second.getSummaryList();
-    for (auto &GVS : SummaryList) {
-      if (GlobalValue::isLocalLinkage(GVS->linkage()))
+  if (whole_program) {
+    // Crate-graph LTO: the index contains every Rust module of the final
+    // artifact and `preserved_symbols` lists everything the artifact exports
+    // (the same list fat LTO internalizes against). Like LLVM's own LTO, keep
+    // only the following symbols external, everything else defined in exactly
+    // one module and referenced only from there is internalized.
+    //  * preserved symbols,
+    //  * symbols referenced from `llvm.used` / `llvm.compiler.used` (e.g. by
+    //    module-level asm),
+    //  * symbols referenced (called or used) from a module other than the one
+    //    defining them (or defined in several modules).
+    // Imported values are handled by the export lists below.
+    for (auto GUID : Ret->GUIDPreservedSymbols)
+      ExportedGUIDs.insert(GUID);
+    for (const char *Name : {"llvm.used", "llvm.compiler.used"}) {
+      ValueInfo VI = Ret->Index.getValueInfo(
+          GlobalValue::getGUIDAssumingExternalLinkage(Name));
+      if (!VI)
         continue;
-      auto GUID = GVS->getOriginalName();
-      if (GVS->flags().Live)
-        ExportedGUIDs.insert(GUID);
+      for (auto &S : VI.getSummaryList())
+        for (auto &Ref : S->refs())
+          ExportedGUIDs.insert(Ref.getGUID());
+    }
+    for (auto &ModuleAndDefs : Ret->ModuleToDefinedGVSummaries) {
+      StringRef ModPath = ModuleAndDefs.first;
+      auto MarkRef = [&](ValueInfo VI) {
+        if (!VI)
+          return;
+        for (auto &S : VI.getSummaryList())
+          if (S->modulePath() != ModPath) {
+            ExportedGUIDs.insert(VI.getGUID());
+            return;
+          }
+      };
+      for (auto &GUIDAndSummary : ModuleAndDefs.second) {
+        GlobalValueSummary *S = GUIDAndSummary.second;
+        for (auto &Ref : S->refs())
+          MarkRef(Ref);
+        if (auto *AS = dyn_cast<AliasSummary>(S)) {
+          if (AS->hasAliasee())
+            MarkRef(AS->getAliaseeVI());
+        } else if (auto *FS = dyn_cast<FunctionSummary>(S)) {
+          for (auto &Edge : FS->calls())
+            MarkRef(Edge.first);
+        }
+      }
+    }
+  } else {
+    for (auto &List : Ret->Index) {
+      const auto &SummaryList = List.second.getSummaryList();
+      for (auto &GVS : SummaryList) {
+        if (GlobalValue::isLocalLinkage(GVS->linkage()))
+          continue;
+        auto GUID = GVS->getOriginalName();
+        if (GVS->flags().Live)
+          ExportedGUIDs.insert(GUID);
+      }
     }
   }
   auto isExported = [&](StringRef ModuleIdentifier, ValueInfo VI) {
