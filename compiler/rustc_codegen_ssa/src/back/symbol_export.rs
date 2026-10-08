@@ -502,6 +502,17 @@ fn upstream_monomorphizations_provider(
     let drop_glue_fn_def_id = tcx.lang_items().drop_glue_fn();
     let async_drop_in_place_fn_def_id = tcx.lang_items().async_drop_in_place_fn();
 
+    // Decoding the exported generic symbols of every upstream crate is the expensive part
+    // (hundreds of crates for large dependency graphs): with multiple threads, decode them in
+    // parallel first. The map is still built in crate order below, so the result is unchanged.
+    if rustc_data_structures::sync::is_dyn_thread_safe() {
+        rustc_data_structures::sync::par_for_each_in(&cnums[..], |&&cnum| {
+            if tcx.crate_dep_kind(cnum) != CrateDepKind::Conditional {
+                let _ = tcx.exported_generic_symbols(cnum);
+            }
+        });
+    }
+
     for &cnum in cnums.iter() {
         // It should be possible to compile to build a crate against a conditional dependency then
         // later link that crate without the conditional dependency, so we cannot use exported
