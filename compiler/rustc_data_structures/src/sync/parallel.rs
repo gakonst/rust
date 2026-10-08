@@ -224,6 +224,61 @@ pub fn par_for_each_in_order<I: DynSync>(items: &[I], for_each: impl Fn(&I) + Dy
     });
 }
 
+/// Processes a dynamically growing set of work items: `process` handles one item and pushes the
+/// follow-up items it discovers onto the given vector; each of those is processed later in turn.
+///
+/// With the parallel frontend, every follow-up item becomes a separate task of one thread pool
+/// scope, so any thread can pick up any part of the work and nested work never waits on a stack
+/// (unlike recursive `par_for_each_in` calls, whose blocking waits nest). The thread that
+/// discovered follow-up items continues with the first one itself. Without the parallel frontend,
+/// items are processed depth-first: all follow-ups of an item (and theirs) before its next sibling.
+pub fn par_work_queue<T: DynSend>(roots: Vec<T>, process: impl Fn(T, &mut Vec<T>) + DynSync + DynSend) {
+    parallel_guard(|guard| {
+        if let Some(proof) = mode::check_dyn_thread_safe() {
+            let process = proof.derive(process);
+            let roots = proof.derive(roots);
+            rustc_thread_pool::scope(|s| {
+                for root in roots.into_inner().into_iter().rev() {
+                    work_queue_spawn(s, proof.derive(root), &process, guard);
+                }
+            });
+        } else {
+            let mut stack: Vec<T> = roots;
+            stack.reverse();
+            let mut next = Vec::new();
+            while let Some(item) = stack.pop() {
+                guard.run(|| process(item, &mut next));
+                stack.extend(next.drain(..).rev());
+            }
+        }
+    });
+}
+
+fn work_queue_spawn<'s, T: DynSend + 's, F: Fn(T, &mut Vec<T>) + DynSync + DynSend + 's>(
+    s: &rustc_thread_pool::Scope<'s>,
+    item: FromDyn<T>,
+    process: &'s FromDyn<F>,
+    guard: &'s ParallelGuard,
+) {
+    s.spawn(move |s| {
+        let mut item = item;
+        let mut next = Vec::new();
+        loop {
+            guard.run(|| (**process)(item.into_inner(), &mut next));
+            if next.is_empty() {
+                break;
+            }
+            let mut rest = next.drain(..);
+            let first = rest.next().unwrap();
+            // Spawned in reverse so that this thread pops them (LIFO) in order after `first`.
+            for n in rest.rev() {
+                work_queue_spawn(s, process.derive(n), process, guard);
+            }
+            item = process.derive(first);
+        }
+    });
+}
+
 // FIXME: actually make parallel and `T: DynSend`
 pub fn par_for_each_slice<T>(items: &mut [T], for_each: impl Fn(&mut T)) {
     parallel_guard(|guard| {
