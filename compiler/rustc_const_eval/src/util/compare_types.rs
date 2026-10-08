@@ -5,7 +5,7 @@
 
 use rustc_infer::infer::TyCtxtInferExt;
 use rustc_middle::traits::ObligationCause;
-use rustc_middle::ty::{Ty, TyCtxt, TypingEnv, Unnormalized, Variance};
+use rustc_middle::ty::{Ty, TyCtxt, TypingEnv, TypingMode, Unnormalized, Variance};
 use rustc_trait_selection::traits::ObligationCtxt;
 
 /// Returns whether `src` is a subtype of `dest`, i.e. `src <: dest`.
@@ -31,6 +31,29 @@ pub fn relate_types<'tcx>(
     dest: Ty<'tcx>,
 ) -> bool {
     if src == dest {
+        return true;
+    }
+
+    // After analysis, regions are irrelevant here (the inference context below ignores them),
+    // so if both types normalize (via the cached `normalize_erasing_regions` query) to the same
+    // type, relating them is guaranteed to succeed. This avoids re-proving the same projection
+    // obligations from scratch in a fresh inference context for every check (e.g. for every field
+    // projection in the always-on MIR validation of large drop shims).
+    let after_analysis = match typing_env.typing_mode() {
+        TypingMode::PostAnalysis | TypingMode::Codegen => true,
+        TypingMode::Coherence
+        | TypingMode::Typeck { .. }
+        | TypingMode::PostTypeckUntilBorrowck { .. }
+        | TypingMode::PostBorrowck { .. }
+        | TypingMode::Reflection
+        | TypingMode::ErasedNotCoherence(_) => false,
+    };
+    if after_analysis
+        && let Ok(src_norm) = tcx.try_normalize_erasing_regions(typing_env, Unnormalized::new_wip(src))
+        && let Ok(dest_norm) =
+            tcx.try_normalize_erasing_regions(typing_env, Unnormalized::new_wip(dest))
+        && src_norm == dest_norm
+    {
         return true;
     }
 
