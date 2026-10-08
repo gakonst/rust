@@ -101,7 +101,7 @@ use std::path::{Path, PathBuf};
 use rustc_attr_ir::lang_items::LangItem;
 use rustc_attr_ir::{InlineAttr, Linkage};
 use rustc_data_structures::either::Either;
-use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
+use rustc_data_structures::fx::{FxHashSet, FxIndexMap, FxIndexSet};
 use rustc_data_structures::sync::par_join;
 use rustc_data_structures::unord::{UnordMap, UnordSet};
 use rustc_hir::def::DefKind;
@@ -1145,6 +1145,16 @@ where
 
     let mut symbols: Vec<_> =
         mono_items.map(|mono_item| (mono_item, mono_item.symbol_name(tcx))).collect();
+
+    // Symbol names are distinct in every crate that compiles, and checking that with a hash set
+    // is much cheaper than sorting (large crates have millions of long mangled names that share
+    // long prefixes). Only if there is a duplicate do we sort, so that the reported pair is
+    // chosen deterministically, exactly as before.
+    let mut seen = FxHashSet::with_capacity_and_hasher(symbols.len(), Default::default());
+    if symbols.iter().all(|&(_, sym)| seen.insert(sym.name)) {
+        return;
+    }
+    drop(seen);
 
     symbols.sort_by_key(|sym| sym.1);
 
