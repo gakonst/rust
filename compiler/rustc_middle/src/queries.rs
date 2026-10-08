@@ -2085,6 +2085,14 @@ rustc_queries! {
         separate_provide_extern
     }
 
+    /// For every trait, the upstream crates (in `crates(())` order) that contain at least one
+    /// impl of it. `trait_impls_of` uses this to only call `implementations_of_trait` for crates
+    /// that can return a non-empty list, instead of for every crate in the graph.
+    query extern_trait_impl_crates(_: ()) -> &'tcx rustc_data_structures::fx::FxIndexMap<DefId, Vec<CrateNum>> {
+        arena_cache
+        desc { "finding the upstream crates that implement each trait" }
+    }
+
     /// Given a crate and a trait, look up all impls of that trait in the crate.
     /// Return `(impl_id, self_ty)`.
     query implementations_of_trait(_: (CrateNum, DefId)) -> &'tcx [(DefId, Option<SimplifiedType>)] {
