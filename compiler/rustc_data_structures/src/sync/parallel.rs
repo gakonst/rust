@@ -4,7 +4,7 @@
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 use crate::FatalErrorMarker;
 use crate::sync::{DynSend, DynSync, FromDyn, IntoDynSyncSend, mode};
@@ -252,6 +252,153 @@ pub fn par_work_queue<T: DynSend>(roots: Vec<T>, process: impl Fn(T, &mut Vec<T>
             }
         }
     });
+}
+
+/// Computes `compute(job)` for every job on the thread pool, at most `lookahead` jobs ahead of a
+/// consumer that takes the results strictly in job order.
+///
+/// `consume` runs on the current thread and receives a `take` callback: every call returns the
+/// result of the next job (in the order of `jobs`). If no worker has started that job yet, `take`
+/// computes it on the current thread; while waiting for a worker to finish it, the current thread
+/// computes other pending jobs within the lookahead. Unlike fixed batches with a barrier after each
+/// batch, workers pick up the next job as soon as they finish one. A panic in `compute` resumes on
+/// the current thread when `take` reaches the job that panicked (as if it had been computed there).
+///
+/// Without the parallel frontend (or with `workers == 0`), `take` simply computes the next job.
+pub fn par_ordered_jobs<J: DynSend, R: DynSend, T>(
+    jobs: Vec<J>,
+    workers: usize,
+    lookahead: usize,
+    compute: impl Fn(J) -> R + DynSync + DynSend,
+    consume: impl FnOnce(&mut dyn FnMut() -> R) -> T,
+) -> T {
+    let Some(proof) = mode::check_dyn_thread_safe().filter(|_| workers > 0 && jobs.len() > 1)
+    else {
+        let mut jobs = jobs.into_iter();
+        return consume(&mut || compute(jobs.next().expect("`take` called more often than there are jobs")));
+    };
+    let n = jobs.len();
+    let shared = proof.derive((
+        Mutex::new(OrderedJobs {
+            jobs: jobs.into_iter().map(Some).collect(),
+            results: (0..n).map(|_| None).collect(),
+            claimed: vec![false; n],
+            next: 0,
+            consumed: 0,
+            active: 0,
+        }),
+        Condvar::new(),
+    ));
+    let compute = proof.derive(compute);
+    let ctx = OrderedJobsCtx { shared: &shared, compute: &compute, workers, lookahead: lookahead.max(1) };
+    rustc_thread_pool::in_place_scope(|s| {
+        ctx.top_up(s, &mut ctx.shared.0.lock());
+        consume(&mut || ctx.take(s))
+    })
+}
+
+struct OrderedJobs<J, R> {
+    jobs: Vec<Option<J>>,
+    results: Vec<Option<Result<R, IntoDynSyncSend<Box<dyn Any + Send + 'static>>>>>,
+    /// Whether a worker or the consumer has started the job.
+    claimed: Vec<bool>,
+    /// Index of the first job that may still be unclaimed.
+    next: usize,
+    /// Number of results taken by the consumer.
+    consumed: usize,
+    /// Number of spawned workers that have not finished.
+    active: usize,
+}
+
+struct OrderedJobsCtx<'a, J, R, F> {
+    shared: &'a FromDyn<(Mutex<OrderedJobs<J, R>>, Condvar)>,
+    compute: &'a FromDyn<F>,
+    workers: usize,
+    lookahead: usize,
+}
+
+impl<J, R, F> Clone for OrderedJobsCtx<'_, J, R, F> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<J, R, F> Copy for OrderedJobsCtx<'_, J, R, F> {}
+
+impl<'a, J: DynSend, R: DynSend, F: Fn(J) -> R + DynSync + DynSend> OrderedJobsCtx<'a, J, R, F> {
+    /// Claims the next unclaimed job within the lookahead, if any.
+    fn claim(&self, st: &mut OrderedJobs<J, R>) -> Option<(usize, J)> {
+        while st.next < st.jobs.len() && st.claimed[st.next] {
+            st.next += 1;
+        }
+        let k = st.next;
+        if k >= st.jobs.len() || k >= st.consumed + self.lookahead {
+            return None;
+        }
+        st.next += 1;
+        st.claimed[k] = true;
+        Some((k, st.jobs[k].take().unwrap()))
+    }
+
+    fn run(&self, job: J) -> Result<R, IntoDynSyncSend<Box<dyn Any + Send + 'static>>> {
+        catch_unwind(AssertUnwindSafe(|| (**self.compute)(job))).map_err(IntoDynSyncSend)
+    }
+
+    fn top_up(&self, s: &rustc_thread_pool::Scope<'a>, st: &mut OrderedJobs<J, R>) {
+        let available = st.jobs.len().min(st.consumed + self.lookahead);
+        let unclaimed = (st.next..available).filter(|&k| !st.claimed[k]).count();
+        while st.active < self.workers.min(unclaimed) {
+            st.active += 1;
+            let ctx = *self;
+            s.spawn(move |_| ctx.work());
+        }
+    }
+
+    fn work(&self) {
+        let mut st = self.shared.0.lock();
+        while let Some((k, job)) = self.claim(&mut st) {
+            drop(st);
+            let result = self.run(job);
+            st = self.shared.0.lock();
+            st.results[k] = Some(result);
+            self.shared.1.notify_all();
+        }
+        st.active -= 1;
+    }
+
+    fn take(&self, s: &rustc_thread_pool::Scope<'a>) -> R {
+        let mut st = self.shared.0.lock();
+        let k = st.consumed;
+        assert!(k < st.jobs.len(), "`take` called more often than there are jobs");
+        let result = loop {
+            if let Some(result) = st.results[k].take() {
+                break result;
+            }
+            if !st.claimed[k] {
+                st.claimed[k] = true;
+                let job = st.jobs[k].take().unwrap();
+                drop(st);
+                let result = self.run(job);
+                st = self.shared.0.lock();
+                break result;
+            }
+            // Help with other pending jobs instead of idling until the next result is ready.
+            if let Some((j, job)) = self.claim(&mut st) {
+                drop(st);
+                let result = self.run(job);
+                st = self.shared.0.lock();
+                st.results[j] = Some(result);
+                continue;
+            }
+            self.shared.1.wait(&mut st);
+        };
+        st.consumed = k + 1;
+        self.top_up(s, &mut st);
+        drop(st);
+        match result {
+            Ok(r) => r,
+            Err(IntoDynSyncSend(panic)) => resume_unwind(panic),
+        }
+    }
 }
 
 fn work_queue_spawn<'s, T: DynSend + 's, F: Fn(T, &mut Vec<T>) + DynSync + DynSend + 's>(
