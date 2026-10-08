@@ -102,6 +102,7 @@ use rustc_attr_ir::lang_items::LangItem;
 use rustc_attr_ir::{InlineAttr, Linkage, find_attr};
 use rustc_data_structures::either::Either;
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap, FxIndexSet, IndexEntry};
+use rustc_data_structures::sso::SsoHashSet;
 use rustc_data_structures::sync::{par_join, par_map};
 use rustc_data_structures::unord::{UnordMap, UnordSet};
 use rustc_hir::def::DefKind;
@@ -115,7 +116,7 @@ use rustc_middle::mono::{
     MonoItemPartitions, Visibility,
 };
 use rustc_middle::ty::print::{characteristic_def_id_of_type, with_no_trimmed_paths};
-use rustc_middle::ty::{self, InstanceKind, ShimKind, TyCtxt};
+use rustc_middle::ty::{self, InstanceKind, ShimKind, Ty, TyCtxt};
 use rustc_middle::util::Providers;
 use rustc_session::CodegenUnits;
 use rustc_session::config::{DumpMonoStatsFormat, SwitchWithOptPath};
@@ -832,13 +833,23 @@ fn characteristic_def_id_of_mono_item<'tcx>(
                     return None;
                 }
 
-                // This is a method within an impl, find out what the self-type is:
-                let impl_self_ty = tcx.instantiate_and_normalize_erasing_regions(
-                    instance.args,
-                    ty::TypingEnv::fully_monomorphized(),
-                    tcx.type_of(impl_def_id),
-                );
-                if let Some(def_id) = characteristic_def_id_of_type(impl_self_ty) {
+                // This is a method within an impl, find out what the self-type is. Usually the
+                // answer does not depend on the generic arguments of the impl (e.g. for any
+                // `impl<T> Foo<T>`), so look at the generic self-type first: instantiating and
+                // normalizing a self-type like `Foo<HugeFuture>` for every method is not cheap.
+                let impl_self_ty = tcx.type_of(impl_def_id);
+                let generic_self_ty = impl_self_ty.instantiate_identity().skip_normalization();
+                let characteristic = match characteristic_def_id_of_generic_type(generic_self_ty) {
+                    Ok(characteristic) => characteristic,
+                    Err(()) => characteristic_def_id_of_type(
+                        tcx.instantiate_and_normalize_erasing_regions(
+                            instance.args,
+                            ty::TypingEnv::fully_monomorphized(),
+                            impl_self_ty,
+                        ),
+                    ),
+                };
+                if let Some(def_id) = characteristic {
                     return Some(def_id);
                 }
             }
@@ -848,6 +859,65 @@ fn characteristic_def_id_of_mono_item<'tcx>(
         MonoItem::Static(def_id) => Some(def_id),
         MonoItem::GlobalAsm(item_id) => Some(item_id.owner_id.to_def_id()),
     }
+}
+
+/// Returns what [`characteristic_def_id_of_type`] returns for every instantiation of the generic
+/// type `ty` (after normalization), or `Err(())` if that may depend on the instantiation, i.e. if
+/// the search would reach a type parameter or an alias before it finds a `DefId`.
+///
+/// This must mirror `characteristic_def_id_of_type` exactly: instantiating and normalizing only
+/// replaces the `Param`s and `Alias`es (and regions) in a type, so as long as the search does not
+/// reach one, it follows the same path and finds the same answer.
+fn characteristic_def_id_of_generic_type<'tcx>(ty: Ty<'tcx>) -> Result<Option<DefId>, ()> {
+    fn search<'tcx>(ty: Ty<'tcx>, visited: &mut SsoHashSet<Ty<'tcx>>) -> Result<Option<DefId>, ()> {
+        match *ty.kind() {
+            ty::Adt(adt_def, _) => Ok(Some(adt_def.did())),
+
+            ty::Dynamic(data, ..) => Ok(data.principal_def_id()),
+
+            ty::Pat(subty, _) | ty::Array(subty, _) | ty::Slice(subty) => search(subty, visited),
+
+            ty::RawPtr(ty, _) | ty::Ref(_, ty, _) => search(ty, visited),
+
+            ty::Tuple(tys) => {
+                for ty in tys {
+                    // A repeated element has been searched already without finding anything
+                    // (otherwise we would have returned), just like in the instantiated type.
+                    if visited.insert(ty) {
+                        if let found @ (Ok(Some(_)) | Err(())) = search(ty, visited) {
+                            return found;
+                        }
+                    }
+                }
+                Ok(None)
+            }
+
+            ty::FnDef(def_id, _)
+            | ty::Closure(def_id, _)
+            | ty::CoroutineClosure(def_id, _)
+            | ty::Coroutine(def_id, _)
+            | ty::CoroutineWitness(def_id, _)
+            | ty::Foreign(def_id) => Ok(Some(def_id)),
+
+            ty::Bool
+            | ty::Char
+            | ty::Int(_)
+            | ty::Uint(_)
+            | ty::Str
+            | ty::FnPtr(..)
+            | ty::UnsafeBinder(_)
+            | ty::Never
+            | ty::Float(_) => Ok(None),
+
+            ty::Alias(..)
+            | ty::Param(_)
+            | ty::Placeholder(..)
+            | ty::Infer(_)
+            | ty::Bound(..)
+            | ty::Error(_) => Err(()),
+        }
+    }
+    search(ty, &mut SsoHashSet::new())
 }
 
 fn compute_codegen_unit_name(
