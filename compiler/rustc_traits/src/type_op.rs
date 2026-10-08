@@ -33,7 +33,7 @@ fn type_op_ascribe_user_type<'tcx>(
     tcx: TyCtxt<'tcx>,
     canonicalized: CanonicalQueryInput<'tcx, ParamEnvAnd<'tcx, AscribeUserType<'tcx>>>,
 ) -> Result<&'tcx Canonical<'tcx, QueryResponse<'tcx, ()>>, NoSolution> {
-    tcx.infer_ctxt().enter_canonical_trait_query(&canonicalized, |ocx, key| {
+    tcx.infer_ctxt().enter_canonical_nll_type_op_query(&canonicalized, |ocx, key| {
         type_op_ascribe_user_type_with_span(ocx, key, DUMMY_SP)
     })
 }
@@ -58,35 +58,35 @@ fn type_op_normalize_ty<'tcx>(
     tcx: TyCtxt<'tcx>,
     canonicalized: CanonicalQueryInput<'tcx, ParamEnvAnd<'tcx, Normalize<'tcx, Ty<'tcx>>>>,
 ) -> Result<&'tcx Canonical<'tcx, QueryResponse<'tcx, Ty<'tcx>>>, NoSolution> {
-    tcx.infer_ctxt().enter_canonical_trait_query(&canonicalized, type_op_normalize)
+    tcx.infer_ctxt().enter_canonical_nll_type_op_query(&canonicalized, type_op_normalize)
 }
 
 fn type_op_normalize_clause<'tcx>(
     tcx: TyCtxt<'tcx>,
     canonicalized: CanonicalQueryInput<'tcx, ParamEnvAnd<'tcx, Normalize<'tcx, Clause<'tcx>>>>,
 ) -> Result<&'tcx Canonical<'tcx, QueryResponse<'tcx, Clause<'tcx>>>, NoSolution> {
-    tcx.infer_ctxt().enter_canonical_trait_query(&canonicalized, type_op_normalize)
+    tcx.infer_ctxt().enter_canonical_nll_type_op_query(&canonicalized, type_op_normalize)
 }
 
 fn type_op_normalize_fn_sig<'tcx>(
     tcx: TyCtxt<'tcx>,
     canonicalized: CanonicalQueryInput<'tcx, ParamEnvAnd<'tcx, Normalize<'tcx, FnSig<'tcx>>>>,
 ) -> Result<&'tcx Canonical<'tcx, QueryResponse<'tcx, FnSig<'tcx>>>, NoSolution> {
-    tcx.infer_ctxt().enter_canonical_trait_query(&canonicalized, type_op_normalize)
+    tcx.infer_ctxt().enter_canonical_nll_type_op_query(&canonicalized, type_op_normalize)
 }
 
 fn type_op_normalize_poly_fn_sig<'tcx>(
     tcx: TyCtxt<'tcx>,
     canonicalized: CanonicalQueryInput<'tcx, ParamEnvAnd<'tcx, Normalize<'tcx, PolyFnSig<'tcx>>>>,
 ) -> Result<&'tcx Canonical<'tcx, QueryResponse<'tcx, PolyFnSig<'tcx>>>, NoSolution> {
-    tcx.infer_ctxt().enter_canonical_trait_query(&canonicalized, type_op_normalize)
+    tcx.infer_ctxt().enter_canonical_nll_type_op_query(&canonicalized, type_op_normalize)
 }
 
 fn type_op_prove_predicate<'tcx>(
     tcx: TyCtxt<'tcx>,
     canonicalized: CanonicalQueryInput<'tcx, ParamEnvAnd<'tcx, ProvePredicate<'tcx>>>,
 ) -> Result<&'tcx Canonical<'tcx, QueryResponse<'tcx, ()>>, NoSolution> {
-    tcx.infer_ctxt().enter_canonical_trait_query(&canonicalized, |ocx, key| {
+    tcx.infer_ctxt().enter_canonical_nll_type_op_query(&canonicalized, |ocx, key| {
         type_op_prove_predicate_with_cause(ocx, key, ObligationCause::dummy());
         Ok(())
     })
