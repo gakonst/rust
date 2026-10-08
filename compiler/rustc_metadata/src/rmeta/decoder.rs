@@ -2088,6 +2088,10 @@ impl CrateMetadata {
         self.root.has_global_allocator
     }
 
+    pub(crate) fn exported_generic_symbols_have_c_level(&self) -> bool {
+        self.root.exported_generic_symbols_have_c_level
+    }
+
     pub(crate) fn has_alloc_error_handler(&self) -> bool {
         self.root.has_alloc_error_handler
     }

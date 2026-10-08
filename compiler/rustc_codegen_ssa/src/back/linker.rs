@@ -7,6 +7,7 @@ use std::{env, iter, mem, str};
 use find_msvc_tools;
 use rustc_attr_ir::WindowsSubsystemKind;
 use rustc_hir::def_id::{CrateNum, LOCAL_CRATE};
+use rustc_metadata::creader::CStore;
 use rustc_middle::middle::dependency_format::Linkage;
 use rustc_middle::middle::exported_symbols::{
     self, ExportedSymbol, SymbolExportInfo, SymbolExportKind, SymbolExportLevel,
@@ -1622,9 +1623,17 @@ impl<'a> Linker for AixLinker<'a> {
     fn add_as_needed(&mut self) {}
 }
 
+/// Calls `callback` for the exported symbols of the local crate and of every dependency that is
+/// linked statically into `crate_type`.
+///
+/// If `only_c_level` is set, the caller ignores symbols that are Rust-level and neither `used`
+/// nor `rustc_std_internal_symbol`. Then the generic symbols of upstream crates that export no
+/// other kind of generic symbol are skipped without decoding them: when linking an executable
+/// against large dependencies, decoding all of their generic symbols is expensive and useless.
 fn for_each_exported_symbols_include_dep<'tcx>(
     tcx: TyCtxt<'tcx>,
     crate_type: CrateType,
+    only_c_level: bool,
     mut callback: impl FnMut(ExportedSymbol<'tcx>, SymbolExportInfo, CrateNum),
 ) {
     let formats = tcx.dependency_formats(());
@@ -1635,6 +1644,12 @@ fn for_each_exported_symbols_include_dep<'tcx>(
         if *dep_format == Linkage::Static {
             for &(symbol, info) in tcx.exported_non_generic_symbols(cnum).iter() {
                 callback(symbol, info, cnum);
+            }
+            if only_c_level
+                && cnum != LOCAL_CRATE
+                && !CStore::from_tcx(tcx).exported_generic_symbols_have_c_level(cnum)
+            {
+                continue;
             }
             for &(symbol, info) in tcx.exported_generic_symbols(cnum).iter() {
                 callback(symbol, info, cnum);
@@ -1713,7 +1728,8 @@ fn exported_symbols_for_non_proc_macro(
 ) -> Vec<SymbolExport> {
     let mut symbols = Vec::new();
     let export_threshold = symbol_export::crates_export_threshold(&[crate_type]);
-    for_each_exported_symbols_include_dep(tcx, crate_type, |symbol, info, cnum| {
+    let only_c_level = export_threshold == SymbolExportLevel::C;
+    for_each_exported_symbols_include_dep(tcx, crate_type, only_c_level, |symbol, info, cnum| {
         // Do not export mangled symbols from cdylibs and don't attempt to export compiler-builtins
         // from any dylib. The latter doesn't work anyway as we use hidden visibility for
         // compiler-builtins. Most linkers silently ignore it, but ld64 gives a warning.
@@ -1783,7 +1799,8 @@ pub(crate) fn linked_symbols(
     let mut symbols = Vec::new();
 
     let export_threshold = symbol_export::crates_export_threshold(&[crate_type]);
-    for_each_exported_symbols_include_dep(tcx, crate_type, |symbol, info, cnum| {
+    let only_c_level = export_threshold == SymbolExportLevel::C;
+    for_each_exported_symbols_include_dep(tcx, crate_type, only_c_level, |symbol, info, cnum| {
         if info.level.is_below_threshold(export_threshold) && !tcx.is_compiler_builtins(cnum)
             || info.used
             || info.rustc_std_internal_symbol

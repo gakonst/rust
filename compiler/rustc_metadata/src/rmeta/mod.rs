@@ -305,6 +305,10 @@ pub(crate) struct CrateRoot {
     stable_order_of_exportable_impls: LazyArray<(DefIndex, usize)>,
     exported_non_generic_symbols: LazyArray<(ExportedSymbol<'static>, SymbolExportInfo)>,
     exported_generic_symbols: LazyArray<(ExportedSymbol<'static>, SymbolExportInfo)>,
+    /// Whether any entry of `exported_generic_symbols` has `SymbolExportLevel::C`, `used` or
+    /// `rustc_std_internal_symbol` set. If not, code that only looks for such symbols (e.g. when
+    /// linking an executable) can skip decoding this crate's (often huge) generic symbol list.
+    exported_generic_symbols_have_c_level: bool,
 
     syntax_contexts: SyntaxContextTable,
     expn_data: ExpnDataTable,
