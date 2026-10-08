@@ -2677,7 +2677,7 @@ options! {
     min_cgu_size: Option<usize> = (None, parse_opt_number, [TRACKED],
         "in non-incremental builds, merge codegen units smaller than this size estimate even \
         when the number of codegen units was given explicitly; 0 disables merging (default: 1800 \
-        for a default count or when compiling for cross-crate LTO, otherwise no merging)"),
+        for a default count, 20000 when compiling for cross-crate LTO, otherwise no merging)"),
     min_function_alignment: Option<Align> = (None, parse_align, [TRACKED],
         "align all functions to at least this many bytes. Must be a power of 2"),
     min_recursion_limit: Option<usize> = (None, parse_opt_number, [TRACKED],

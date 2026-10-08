@@ -482,6 +482,12 @@ fn merge_codegen_units<'tcx>(
     // there is just one CGU, of course). Note that CGU sizes of 100,000+ are
     // common in larger programs, so this isn't all that large.
     const NON_INCR_MIN_CGU_SIZE: usize = 1800;
+    // Minimum size for modules destined for cross-crate (Thin)LTO (see below). Larger than the
+    // default because every such module costs a separate whole-pipeline LTO backend job plus
+    // cross-module import work at link time. Measured on tempo release (thin LTO, explicit 16
+    // CGUs): 20000 instead of 1800 cut the final ThinLTO module count further and total
+    // instructions by 2.2%.
+    const LTO_MIN_CGU_SIZE: usize = 20000;
     // An explicit `-Ccodegen-units` count (documented as a *maximum*) normally disables this
     // merging, except when the crate's modules are destined for cross-crate LTO
     // (`-Clinker-plugin-lto`, or `-Clto=thin/fat` on the final artifact): there each module is
@@ -501,7 +507,7 @@ fn merge_codegen_units<'tcx>(
             && !cx.tcx.is_compiler_builtins(LOCAL_CRATE)
             && !find_attr!(cx.tcx, crate, NoBuiltins) =>
         {
-            Some(NON_INCR_MIN_CGU_SIZE)
+            Some(LTO_MIN_CGU_SIZE)
         }
         None => None,
     };
