@@ -172,6 +172,16 @@ impl<'tcx> InferCtxt<'tcx> {
             return;
         }
 
+        // Similarly, `T: 'r` trivially holds if `T` has no params, infer, placeholder, bound or
+        // alias types/consts and every free region in `T` is `'r` itself: each of its outlives
+        // components is then `'r: 'r`. Such obligations are very common in the new solver
+        // (e.g. `dyn Trait + '!a: '!a` for every instantiation of a higher-ranked where-clause)
+        // and would otherwise be passed back through every enclosing query response.
+        // This is only done for the new solver to leave the old solver's behavior untouched.
+        if self.next_trait_solver() && type_trivially_outlives(sup_type, sub_region) {
+            return;
+        }
+
         debug!(?sup_type, ?sub_region, ?cause);
         let origin = SubregionOrigin::from_obligation_cause(cause, || {
             SubregionOrigin::RelateParamBound(
@@ -738,4 +748,34 @@ impl<'cx, 'tcx> TypeOutlivesDelegate<'tcx> for &'cx InferCtxt<'tcx> {
     ) {
         self.verify_generic_bound(origin, kind, a, bound)
     }
+}
+
+/// Returns `true` if `ty: r` holds for all values of the inference/region variables involved,
+/// because `ty` contains no types or consts whose outlives requirements could be non-trivial
+/// (params, inference variables, placeholders, bound variables, aliases, errors) and every free
+/// region in `ty` is `r` itself. All outlives components of such a type are `r: r`.
+fn type_trivially_outlives<'tcx>(ty: Ty<'tcx>, r: Region<'tcx>) -> bool {
+    use rustc_middle::ty::TypeFlags;
+
+    if ty.has_type_flags(
+        TypeFlags::HAS_TY_PARAM
+            | TypeFlags::HAS_CT_PARAM
+            | TypeFlags::HAS_TY_INFER
+            | TypeFlags::HAS_CT_INFER
+            | TypeFlags::HAS_TY_PLACEHOLDER
+            | TypeFlags::HAS_CT_PLACEHOLDER
+            | TypeFlags::HAS_TY_BOUND
+            | TypeFlags::HAS_CT_BOUND
+            | TypeFlags::HAS_ALIAS
+            | TypeFlags::HAS_ERROR
+            | TypeFlags::HAS_RE_ERASED
+            | TypeFlags::HAS_TY_FRESH
+            | TypeFlags::HAS_CT_FRESH,
+    ) {
+        return false;
+    }
+    ty.walk().all(|arg| match arg.kind() {
+        GenericArgKind::Lifetime(lt) => lt == r || matches!(lt.kind(), ty::ReBound(..)),
+        GenericArgKind::Type(_) | GenericArgKind::Const(_) => true,
+    })
 }
