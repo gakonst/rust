@@ -386,14 +386,13 @@ struct WalkItem<'tcx> {
 /// Whether the path to an item already instantiates some function recursively so often (a
 /// fraction of the recursion limit) that the item may be part of an infinite or overflowing
 /// instantiation; see [`check_recursion_limit`] for the adjusted depth of drop glue.
-#[allow(rustc::potential_query_instability)] // `any` does not depend on the iteration order
 fn is_deep_recursion<'tcx>(
     tcx: TyCtxt<'tcx>,
     recursion_depths: &DefIdMap<usize>,
     recursion_limit: Limit,
 ) -> bool {
     let threshold = (recursion_limit.0 / 8).max(4);
-    recursion_depths.iter().any(|(&def_id, &depth)| {
+    recursion_depths.items().any(|(&def_id, &depth)| {
         let depth = if tcx.is_lang_item(def_id, LangItem::DropGlue) { depth / 4 } else { depth };
         depth >= threshold
     })
