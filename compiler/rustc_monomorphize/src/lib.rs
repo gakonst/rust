@@ -29,11 +29,28 @@ fn custom_coerce_unsize_info<'tcx>(
     source_ty: Ty<'tcx>,
     target_ty: Ty<'tcx>,
 ) -> Result<CustomCoerceUnsized, ErrorGuaranteed> {
-    let trait_ref = ty::TraitRef::new(
-        tcx.tcx,
-        tcx.require_lang_item(LangItem::CoerceUnsized, tcx.span),
-        [source_ty, target_ty],
-    );
+    let coerce_unsized_trait = tcx.require_lang_item(LangItem::CoerceUnsized, tcx.span);
+
+    // Fast path: the MIR we are monomorphizing contains this unsizing cast, so it was already
+    // proven well-formed, and `CoerceUnsized` has no builtin impls for ADTs. If exactly one
+    // impl in the whole crate graph can apply to this ADT, selection can only pick that impl,
+    // and all we need from it is which field it coerces. This skips re-proving the nested
+    // `Unsize` obligations (e.g. auto traits of huge async-fn futures for
+    // `Pin<Box<Fut>> -> Pin<Box<dyn Future + Send>>`) after monomorphization.
+    if let ty::Adt(adt_def, _) = source_ty.kind() {
+        let impls = tcx.trait_impls_of(coerce_unsized_trait);
+        if impls.blanket_impls().is_empty()
+            && let Some(&[impl_def_id]) = impls
+                .non_blanket_impls()
+                .get(&ty::fast_reject::SimplifiedType::Adt(adt_def.did()))
+                .map(|v| v.as_slice())
+            && let Some(custom_kind) = tcx.coerce_unsized_info(impl_def_id)?.custom_kind
+        {
+            return Ok(custom_kind);
+        }
+    }
+
+    let trait_ref = ty::TraitRef::new(tcx.tcx, coerce_unsized_trait, [source_ty, target_ty]);
 
     match tcx
         .codegen_select_candidate(ty::TypingEnv::fully_monomorphized().as_query_input(trait_ref))
