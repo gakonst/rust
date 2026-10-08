@@ -867,42 +867,6 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
 }
 
 impl<'a, 'tcx> FulfillProcessor<'a, 'tcx> {
-    /// Tries to prove an obligation via the (globally cached) evaluation query instead of
-    /// processing it via selection and nested obligations. Returns the evaluation result if
-    /// the obligation is known to hold.
-    ///
-    /// Usually this is only done for global obligations that hold *considering regions*.
-    /// However, when this inference context ignores regions (region obligations are dropped
-    /// in `process_obligation` anyway) and we are in codegen, where all regions are erased,
-    /// region variables and erased regions are irrelevant and holding *modulo regions* is
-    /// enough: processing the obligation via selection could not produce any other result.
-    /// This matters because erased regions and region variables make an obligation
-    /// non-global, so in codegen almost every obligation used to be re-proven via
-    /// selection, recursively for every nested obligation (e.g. `Send` for huge async-fn
-    /// state machines when unsizing to `dyn Future + Send` or checking impl where-clauses).
-    fn evaluate_to_holds(
-        &self,
-        obligation: &PredicateObligation<'tcx>,
-    ) -> Option<EvaluationResult> {
-        let infcx = self.selcx.infcx;
-        let modulo_regions =
-            !infcx.considering_regions && matches!(self.selcx.typing_mode(), TypingMode::Codegen);
-        let pred = obligation.predicate;
-        if modulo_regions {
-            if pred.has_non_region_infer() || pred.has_placeholders() || pred.has_param() {
-                return None;
-            }
-            let result = infcx.evaluate_obligation_no_overflow(obligation);
-            result.must_apply_modulo_regions().then_some(result)
-        } else {
-            if !pred.is_global() {
-                return None;
-            }
-            let result = infcx.evaluate_obligation_no_overflow(obligation);
-            result.must_apply_considering_regions().then_some(result)
-        }
-    }
-
     #[instrument(level = "debug", skip(self, obligation, stalled_on))]
     fn process_trait_obligation(
         &mut self,
@@ -912,11 +876,16 @@ impl<'a, 'tcx> FulfillProcessor<'a, 'tcx> {
     ) -> ProcessResult<PendingPredicateObligation<'tcx>, FulfillmentErrorCode<'tcx>> {
         debug_assert!(!self.selcx.typing_mode().is_coherence(), "old solver coherence");
         let infcx = self.selcx.infcx;
-        // If no type variables are present, we can use evaluation for better caching.
-        // FIXME: consider caching errors too.
-        if self.evaluate_to_holds(obligation).is_some() {
-            debug!("selecting trait at depth {} evaluated to holds", obligation.recursion_depth);
-            return ProcessResult::Changed(Default::default());
+        if obligation.predicate.is_global() {
+            // no type variables present, can use evaluation for better caching.
+            // FIXME: consider caching errors too.
+            if infcx.predicate_must_hold_considering_regions(obligation) {
+                debug!(
+                    "selecting trait at depth {} evaluated to holds",
+                    obligation.recursion_depth
+                );
+                return ProcessResult::Changed(Default::default());
+            }
         }
 
         match self.selcx.poly_select(&trait_obligation) {
@@ -963,19 +932,27 @@ impl<'a, 'tcx> FulfillProcessor<'a, 'tcx> {
 
         let tcx = self.selcx.tcx();
         let infcx = self.selcx.infcx;
-        // If no type variables are present, we can use evaluation for better caching.
-        // FIXME: consider caching errors too.
-        if let Some(result) = self.evaluate_to_holds(obligation) {
-            if let Some(key) = ProjectionCacheKey::from_poly_projection_obligation(
-                &mut self.selcx,
-                &project_obligation,
-            ) {
-                // If `evaluate_to_holds` succeeds, then we've
-                // evaluated all sub-obligations. We can therefore mark the 'root'
-                // obligation as complete, and skip evaluating sub-obligations.
-                infcx.inner.borrow_mut().projection_cache().complete(key, result);
+        if obligation.predicate.is_global() {
+            // no type variables present, can use evaluation for better caching.
+            // FIXME: consider caching errors too.
+            if infcx.predicate_must_hold_considering_regions(obligation) {
+                if let Some(key) = ProjectionCacheKey::from_poly_projection_obligation(
+                    &mut self.selcx,
+                    &project_obligation,
+                ) {
+                    // If `predicate_must_hold_considering_regions` succeeds, then we've
+                    // evaluated all sub-obligations. We can therefore mark the 'root'
+                    // obligation as complete, and skip evaluating sub-obligations.
+                    infcx
+                        .inner
+                        .borrow_mut()
+                        .projection_cache()
+                        .complete(key, EvaluationResult::EvaluatedToOk);
+                }
+                return ProcessResult::Changed(Default::default());
+            } else {
+                debug!("Does NOT hold: {:?}", obligation);
             }
-            return ProcessResult::Changed(Default::default());
         }
 
         match project::poly_project_and_unify_term(&mut self.selcx, &project_obligation) {
