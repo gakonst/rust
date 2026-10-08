@@ -11,7 +11,7 @@ use rustc_attr_ir::CanonicalSymbols;
 use rustc_attr_ir::diagnostic_items::DiagnosticItems;
 use rustc_crate_store::{CrateSource, ExternCrate};
 use rustc_data_structures::fingerprint::Fingerprint;
-use rustc_data_structures::fx::FxIndexMap;
+use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
 use rustc_data_structures::owned_slice::OwnedSlice;
 use rustc_data_structures::sync::Lock;
 use rustc_data_structures::unhash::UnhashMap;
@@ -1509,6 +1509,25 @@ impl CrateMetadata {
         } else {
             &[]
         }
+    }
+
+    /// The traits (as `DefId`s of the current session) that have at least one impl in this
+    /// crate, in `trait_impls` order. These are exactly the traits for which
+    /// `get_implementations_of_trait` can return a non-empty list.
+    fn traits_with_impls(&self) -> impl Iterator<Item = DefId> {
+        // `get_implementations_of_trait` reverse-translates the trait's crate to the *first*
+        // matching entry of `cnum_map`, so only keys that use that entry are reachable.
+        let mut seen = FxHashSet::default();
+        let first: IndexVec<CrateNum, bool> =
+            self.cnum_map.iter().map(|&global| seen.insert(global)).collect();
+        self.trait_impls.keys().filter_map(move |&(krate, index)| {
+            let local = CrateNum::from_u32(krate);
+            if *first.get(local)? {
+                Some(DefId { krate: self.cnum_map[local], index })
+            } else {
+                None
+            }
+        })
     }
 
     fn get_implementations_of_trait<'tcx>(

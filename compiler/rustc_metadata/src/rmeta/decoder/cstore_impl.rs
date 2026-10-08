@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use rustc_attr_ir::Deprecation;
 use rustc_crate_store::{CrateStore, ExternCrate};
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
 use rustc_hir::def::{CtorKind, DefKind};
 use rustc_hir::def_id::{CrateNum, DefId, DefIdMap, LOCAL_CRATE};
 use rustc_hir::definitions::{DefKey, DefPath, DefPathHash};
@@ -591,6 +591,20 @@ pub(in crate::rmeta) fn provide(providers: &mut Providers) {
         dependency_formats: |tcx, ()| Arc::new(crate::dependency_format::calculate(tcx)),
         has_global_allocator: |tcx, LocalCrate| CStore::from_tcx(tcx).has_global_allocator(),
         has_alloc_error_handler: |tcx, LocalCrate| CStore::from_tcx(tcx).has_alloc_error_handler(),
+        extern_trait_impl_crates: |tcx, ()| {
+            let mut map: FxIndexMap<DefId, Vec<CrateNum>> = FxIndexMap::default();
+            for &cnum in tcx.crates(()) {
+                // Like the extern query providers, register a dependency on the crate metadata.
+                if tcx.dep_graph.is_fully_enabled() {
+                    tcx.ensure_ok().crate_hash(cnum);
+                }
+                let cstore = CStore::from_tcx(tcx);
+                for trait_def_id in cstore.get_crate_data(cnum).traits_with_impls() {
+                    map.entry(trait_def_id).or_default().push(cnum);
+                }
+            }
+            map
+        },
         postorder_cnums: |tcx, ()| {
             tcx.arena.alloc_from_iter(
                 CStore::from_tcx(tcx).crate_dependencies_in_postorder(LOCAL_CRATE).into_iter(),
