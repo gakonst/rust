@@ -1,4 +1,5 @@
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 pub use jobserver_crate::Acquired;
 use jobserver_crate::{Client, FromEnv, FromEnvErrorKind, HelperThread};
@@ -78,10 +79,12 @@ struct ProxyData {
     /// This can happen, for example, if the main thread is waiting for something,
     /// in that case some other thread can start using this token to do work.
     used: u16,
-    /// The number of threads currently requesting a token and waiting.
-    /// If the proxy releases a token it can immediately give it to one of these threads
-    /// without going through the real jobserver.
+    /// The number of threads currently waiting for a token that has not been granted yet.
     pending: u16,
+    /// The number of tokens granted to waiting threads that they have not picked up yet.
+    granted: u16,
+    /// The number of token requests sent to the helper thread that it has not completed yet.
+    requested: u16,
 }
 
 /// A wrapper around jobserver client used for two purposes:
@@ -89,6 +92,13 @@ struct ProxyData {
 ///   cannot be accidentally released.
 /// - "Token buffering", immediately acquiring freshly released tokens if necessary,
 ///   without going through the real jobserver.
+///
+/// Extra tokens (beyond the one the process always holds) are requested with low priority: a
+/// request is only sent to the jobserver when it currently has spare tokens. Otherwise the thread
+/// re-checks periodically (or takes over a token released by another thread of this process).
+/// This keeps the extra threads of the parallel frontend from competing with the build tool for
+/// tokens it needs to start other jobs (e.g. Cargo starting crates or build scripts compiling C
+/// code, which are often on the critical path), while still using all idle cores otherwise.
 pub struct Proxy {
     /// The wrapped jobserver client.
     client: Client,
@@ -100,12 +110,15 @@ pub struct Proxy {
     wake_pending: Condvar,
 }
 
+/// How often a thread waiting for a token checks whether the jobserver has spare tokens.
+const SPARE_TOKEN_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 impl Proxy {
     pub fn new() -> Arc<Self> {
         let proxy = Arc::new(Proxy {
             client: client(),
             // Assume that the main thread is actively doing work when it creates the proxy.
-            data: Mutex::new(ProxyData { used: 1, pending: 0 }),
+            data: Mutex::new(ProxyData { used: 1, pending: 0, granted: 0, requested: 0 }),
             wake_pending: Condvar::new(),
             helper: OnceLock::new(),
         });
@@ -115,14 +128,16 @@ impl Proxy {
             .clone()
             .into_helper_thread(move |token| {
                 // Reminder: this callback runs when the helper acquires a token.
+                let mut data = proxy_.data.lock();
+                data.requested = data.requested.saturating_sub(1);
                 if let Ok(token) = token {
-                    let mut data = proxy_.data.lock();
                     if data.pending > 0 {
                         // The token is still needed, give it to one of the waiting threads.
                         token.drop_without_releasing();
                         assert!(data.used > 0);
                         data.used += 1;
                         data.pending -= 1;
+                        data.granted += 1;
                         proxy_.wake_pending.notify_one();
                     } else {
                         // The token is no longer needed, release it by dropping.
@@ -136,6 +151,12 @@ impl Proxy {
         proxy
     }
 
+    /// Whether the wrapped jobserver currently seems to have a spare token. If this cannot be
+    /// determined, assume that it does (which falls back to requesting tokens eagerly).
+    fn has_spare_token(&self) -> bool {
+        self.client.available().map_or(true, |n| n > 0)
+    }
+
     /// Acquires a token, possibly using some buffered tokens as an optimization.
     /// May block and wait until the token is available.
     pub fn acquire_thread(&self) {
@@ -146,12 +167,30 @@ impl Proxy {
             // Give that token to the current thread.
             assert_eq!(data.pending, 0);
             data.used += 1;
-        } else {
-            // Request a token from the helper thread, this is a non-blocking operation.
-            // Then wait until this or some other request succeeds.
-            self.helper.get().unwrap().request_token();
-            data.pending += 1;
-            self.wake_pending.wait(&mut data);
+            return;
+        }
+
+        data.pending += 1;
+        loop {
+            if data.granted > 0 {
+                // A token was given to us, either by the helper thread or by a thread of this
+                // process that released its token.
+                data.granted -= 1;
+                return;
+            }
+            if data.requested < data.pending && self.has_spare_token() {
+                // Request a token from the helper thread, this is a non-blocking operation.
+                self.helper.get().unwrap().request_token();
+                data.requested += 1;
+            }
+            if data.requested >= data.pending {
+                // Enough requests are in flight, wait until this or some other request succeeds.
+                self.wake_pending.wait(&mut data);
+            } else {
+                // The jobserver had no spare token, check again later (or get woken up when
+                // another thread of this process releases its token).
+                self.wake_pending.wait_for(&mut data, SPARE_TOKEN_POLL_INTERVAL);
+            }
         }
     }
 
@@ -163,6 +202,7 @@ impl Proxy {
         if data.pending > 0 {
             // Immediately give the released token to one of the waiting threads.
             data.pending -= 1;
+            data.granted += 1;
             self.wake_pending.notify_one();
         } else {
             data.used -= 1;
