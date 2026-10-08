@@ -150,6 +150,14 @@ impl<'a, 'tcx> ConstraintConversion<'a, 'tcx> {
         let ty::OutlivesClause(k1, r2) = clause;
         match k1.kind() {
             GenericArgKind::Lifetime(r1) => {
+                // `'a: 'a` is trivially true and would be dropped by
+                // `OutlivesConstraintSet::push` anyway. Bail out before
+                // `to_region_vid`, which would otherwise create a fresh,
+                // unconstrained NLL region variable for every placeholder
+                // (trait solver responses can contain many of them).
+                if r1 == r2 {
+                    return;
+                }
                 let r1_vid = self.to_region_vid(r1);
                 let r2_vid = self.to_region_vid(r2);
                 self.add_outlives(r1_vid, r2_vid, constraint_category, self.span);
@@ -251,6 +259,10 @@ impl<'a, 'b, 'tcx> TypeOutlivesDelegate<'tcx> for &'a mut ConstraintConversion<'
         b: ty::Region<'tcx>,
         constraint_category: ConstraintCategory<'tcx>,
     ) {
+        // Trivially true, see the comment in `ConstraintConversion::convert`.
+        if a == b {
+            return;
+        }
         let b = self.to_region_vid(b);
         let a = self.to_region_vid(a);
         self.add_outlives(b, a, constraint_category, origin.span());
