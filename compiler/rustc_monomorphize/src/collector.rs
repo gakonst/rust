@@ -210,7 +210,7 @@ use std::ops::ControlFlow;
 
 use rustc_attr_ir::InlineAttr;
 use rustc_attr_ir::lang_items::LangItem;
-use rustc_data_structures::fx::FxIndexMap;
+use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
 use rustc_data_structures::sync::{Lock, par_for_each_in};
 use rustc_data_structures::unord::{UnordMap, UnordSet};
 use rustc_hir as hir;
@@ -632,11 +632,23 @@ fn check_normalization_error<'tcx>(
     struct NormalizationChecker<'tcx> {
         tcx: TyCtxt<'tcx>,
         instance: Instance<'tcx>,
+        /// Types already checked successfully. MIR bodies mention the same (often huge, e.g.
+        /// async-fn state machine) types in many places; checking each occurrence re-instantiates
+        /// and re-erases them every time.
+        seen: FxHashSet<Ty<'tcx>>,
     }
     impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for NormalizationChecker<'tcx> {
         type Result = ControlFlow<()>;
 
         fn visit_ty(&mut self, t: Ty<'tcx>) -> Self::Result {
+            // A type without generic parameters and without aliases is unchanged by
+            // instantiation and trivially normalizes, so it cannot fail.
+            if !t.has_param() && !t.has_aliases() {
+                return ControlFlow::Continue(());
+            }
+            if !self.seen.insert(t) {
+                return ControlFlow::Continue(());
+            }
             match self.instance.try_instantiate_mir_and_normalize_erasing_regions(
                 self.tcx,
                 ty::TypingEnv::fully_monomorphized(),
@@ -648,7 +660,7 @@ fn check_normalization_error<'tcx>(
         }
     }
 
-    let mut checker = NormalizationChecker { tcx, instance };
+    let mut checker = NormalizationChecker { tcx, instance, seen: Default::default() };
     if body.visit_with(&mut checker).is_break() { Err(NormalizationErrorInMono) } else { Ok(()) }
 }
 
