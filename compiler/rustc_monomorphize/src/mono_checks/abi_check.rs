@@ -162,14 +162,33 @@ fn do_check_unsized_params<'tcx>(
     }
 }
 
+/// The ABI of a `FnDef` or `FnPtr` type, without instantiating a `FnDef`'s signature.
+fn fn_ty_abi<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> ExternAbi {
+    match *ty.kind() {
+        ty::FnDef(def_id, _) => tcx.fn_sig(def_id).skip_binder().abi(),
+        _ => ty.fn_sig(tcx).abi(),
+    }
+}
+
 /// Checks the ABI of an Instance, emitting an error when:
 ///
 /// - a non-rustic ABI uses unsized parameters
 /// - the signature requires target features that are not enabled
 fn check_instance_abi<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) {
     let typing_env = ty::TypingEnv::fully_monomorphized();
-    let ty = instance.ty(tcx, typing_env);
-    if ty.is_fn() && ty.fn_sig(tcx).abi() == ExternAbi::LlvmIntrinsic {
+    // Only the ABI of the instance's type is needed here, which instantiating and normalizing
+    // `type_of` (as `Instance::ty` does) cannot change unless the type itself is an alias or a
+    // parameter. Avoid that work (and instantiating the full signature) for the common case.
+    let raw_ty = tcx.type_of(instance.def_id()).skip_binder();
+    let is_llvm_intrinsic = if raw_ty.is_fn() {
+        fn_ty_abi(tcx, raw_ty) == ExternAbi::LlvmIntrinsic
+    } else if matches!(raw_ty.kind(), ty::Alias(..) | ty::Param(..)) {
+        let ty = instance.ty(tcx, typing_env);
+        ty.is_fn() && ty.fn_sig(tcx).abi() == ExternAbi::LlvmIntrinsic
+    } else {
+        false
+    };
+    if is_llvm_intrinsic {
         // We disable all checks for the llvm-intrinsic ABI to allow linking to arbitrary
         // LLVM intrinsics
         return;
@@ -211,7 +230,7 @@ fn check_call_site_abi<'tcx>(
     caller: InstanceKind<'tcx>,
     loc: impl Fn() -> (Span, HirId) + Copy,
 ) {
-    let extern_abi = callee.fn_sig(tcx).abi();
+    let extern_abi = fn_ty_abi(tcx, callee);
     if extern_abi.is_rustic_abi() || extern_abi == ExternAbi::LlvmIntrinsic {
         // We directly handle the soundness of Rust ABIs -- so let's skip the majority of
         // call sites to avoid a perf regression.

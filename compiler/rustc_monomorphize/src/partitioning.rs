@@ -387,11 +387,25 @@ fn merge_codegen_units<'tcx>(
     // there is just one CGU, of course). Note that CGU sizes of 100,000+ are
     // common in larger programs, so this isn't all that large.
     const NON_INCR_MIN_CGU_SIZE: usize = 1800;
-    // `-Zmin-cgu-size` applies the same merging (with the given threshold) even when the CGU
-    // count was given explicitly, which `-Ccodegen-units` documents as a *maximum*.
-    let min_cgu_size = match cx.tcx.sess.opts.unstable_opts.min_cgu_size {
+    // An explicit `-Ccodegen-units` count (documented as a *maximum*) normally disables this
+    // merging, except when the crate's modules are destined for cross-crate LTO
+    // (`-Clinker-plugin-lto`, or `-Clto=thin/fat` on the final artifact): there each module is
+    // re-optimized and code-generated again at link time as its own (Thin)LTO backend job, with
+    // fixed per-module costs (cross-module imports, pass pipeline, object emission), so tiny
+    // modules are pure overhead. `no_builtins` crates (e.g. `compiler_builtins`) keep their split.
+    // `-Zmin-cgu-size` overrides the threshold (`0` disables the merging).
+    let sess = cx.tcx.sess;
+    let cross_crate_lto = sess.opts.cg.linker_plugin_lto.enabled()
+        || matches!(sess.lto(), rustc_session::config::Lto::Fat | rustc_session::config::Lto::Thin);
+    let min_cgu_size = match sess.opts.unstable_opts.min_cgu_size {
         Some(n) => Some(n),
-        None if matches!(cx.tcx.sess.codegen_units(), CodegenUnits::Default(_)) => {
+        None if matches!(sess.codegen_units(), CodegenUnits::Default(_)) => {
+            Some(NON_INCR_MIN_CGU_SIZE)
+        }
+        None if cross_crate_lto
+            && !cx.tcx.is_compiler_builtins(LOCAL_CRATE)
+            && !cx.tcx.is_no_builtins(LOCAL_CRATE) =>
+        {
             Some(NON_INCR_MIN_CGU_SIZE)
         }
         None => None,

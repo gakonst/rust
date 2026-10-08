@@ -2537,6 +2537,7 @@ unsafe extern "C" {
         NumModules: size_t,
         PreservedSymbols: *const *const c_char,
         PreservedSymbolsLen: size_t,
+        WholeProgram: bool,
     ) -> Option<&'static mut ThinLTOData>;
     pub(crate) fn LLVMRustPrepareThinLTORename(
         Data: &ThinLTOData,

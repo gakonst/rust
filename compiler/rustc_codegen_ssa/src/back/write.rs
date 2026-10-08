@@ -324,6 +324,9 @@ pub struct CodegenContext {
     pub lto: Lto,
     pub use_linker_plugin_lto: bool,
     pub dylib_lto: bool,
+    /// Internalize symbols not exported from the artifact in crate-graph ThinLTO
+    /// (`-Zthinlto-internalize`).
+    pub thin_lto_internalize: bool,
     pub prefer_dynamic: bool,
     pub save_temps: bool,
     pub fewer_names: bool,
@@ -1259,6 +1262,7 @@ fn start_executing_work<B: WriteBackendMethods>(
         lto: sess.lto(),
         use_linker_plugin_lto: sess.opts.cg.linker_plugin_lto.enabled(),
         dylib_lto: sess.opts.unstable_opts.dylib_lto,
+        thin_lto_internalize: sess.opts.unstable_opts.thinlto_internalize.unwrap_or(false),
         prefer_dynamic: sess.opts.cg.prefer_dynamic,
         fewer_names: sess.fewer_names(),
         save_temps: sess.opts.cg.save_temps,
