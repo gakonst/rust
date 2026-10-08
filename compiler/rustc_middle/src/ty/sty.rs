@@ -10,7 +10,6 @@ use hir::def::{CtorKind, DefKind};
 use rustc_abi::{FIRST_VARIANT, FieldIdx, NumScalableVectors, ScalableElt, VariantIdx};
 use rustc_attr_ir::lang_items::LangItem;
 use rustc_data_structures::intern::Interned;
-use rustc_data_structures::intern::Interned;
 use rustc_errors::{ErrorGuaranteed, MultiSpan};
 use rustc_hir as hir;
 use rustc_hir::def_id::DefId;

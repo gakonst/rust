@@ -713,6 +713,17 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
     }
 
     fn intern_region(self, region_kind: RegionKind<'tcx>) -> Region<'tcx> {
+        // Anonymous placeholders are created over and over again when instantiating
+        // trait-solver query responses, avoid re-hashing them through the interner.
+        if let ty::RePlaceholder(placeholder) = region_kind
+            && let Some(idx) = super::anon_re_placeholder_memo_index(placeholder)
+        {
+            return Region(Interned::new_unchecked(
+                self.lifetimes
+                    .anon_re_placeholders_memo
+                    .get_or_intern(idx, || self.intern_region(region_kind).0.0),
+            ));
+        }
         self.intern_region(region_kind)
     }
 

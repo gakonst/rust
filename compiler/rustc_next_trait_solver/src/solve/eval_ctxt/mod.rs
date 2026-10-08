@@ -1702,8 +1702,8 @@ where
             .deeply_resolve_via_unification_table((self.var_values, external_constraints));
 
         // Remove any trivial or duplicated region constraints once we've resolved regions
-        let mut unique = HashSet::default();
         if let ExternalRegionConstraints::Old(r) = &mut external_constraints.region_constraints {
+            let mut unique = HashSet::with_capacity_and_hasher(r.len(), Default::default());
             r.retain(|(outlives, _)| !outlives.is_trivial() && unique.insert(*outlives));
         }
 
