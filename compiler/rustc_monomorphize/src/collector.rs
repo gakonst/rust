@@ -207,11 +207,12 @@
 
 use std::cell::OnceCell;
 use std::ops::ControlFlow;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rustc_attr_ir::InlineAttr;
 use rustc_attr_ir::lang_items::LangItem;
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
-use rustc_data_structures::sync::{Lock, is_dyn_thread_safe, par_work_queue};
+use rustc_data_structures::sync::{Lock, is_dyn_thread_safe, par_for_each_in, par_work_queue};
 use rustc_data_structures::unord::{UnordMap, UnordSet};
 use rustc_hir as hir;
 use rustc_hir::def::DefKind;
@@ -373,12 +374,29 @@ fn collect_items_root<'tcx>(
     );
 }
 
-/// A pending step of the parallel mono item graph walk: an item, how it is collected, and the
-/// recursion depths along the path that led to it.
+/// A pending step of the parallel mono item graph walk: an item, how it is collected, the root
+/// whose walk discovered it, and the recursion depths along the path that led to it.
 struct WalkItem<'tcx> {
     item: Spanned<MonoItem<'tcx>>,
     mode: CollectionMode,
+    root: usize,
     recursion_depths: DefIdMap<usize>,
+}
+
+/// Whether the path to an item already instantiates some function recursively so often (a
+/// fraction of the recursion limit) that the item may be part of an infinite or overflowing
+/// instantiation; see [`check_recursion_limit`] for the adjusted depth of drop glue.
+#[allow(rustc::potential_query_instability)] // `any` does not depend on the iteration order
+fn is_deep_recursion<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    recursion_depths: &DefIdMap<usize>,
+    recursion_limit: Limit,
+) -> bool {
+    let threshold = (recursion_limit.0 / 8).max(4);
+    recursion_depths.iter().any(|(&def_id, &depth)| {
+        let depth = if tcx.is_lang_item(def_id, LangItem::DropGlue) { depth / 4 } else { depth };
+        depth >= threshold
+    })
 }
 
 /// Collect all monomorphized items reachable from `roots` with the parallel frontend.
@@ -388,6 +406,13 @@ struct WalkItem<'tcx> {
 /// graph is (async state machines form long chains), without nested blocking waits on a stack.
 /// Each item carries a copy of the recursion depths of its path, exactly like the recursive walk.
 /// Which thread visits an item first does not affect the collected items (the result is sorted).
+///
+/// Error behaviour matches walking each root recursively in parallel (the previous scheme):
+/// - a panic (fatal error) while walking a root abandons the rest of that root's walk, while the
+///   other roots continue (their errors are reported too); the panic is resumed at the end;
+/// - once polymorphic recursion gets deep (see [`is_deep_recursion`]), the rest of that path is
+///   walked depth-first on one thread like the serial walk, so programs that hit the recursion
+///   limit report it before other overflows that a racing thread could reach first.
 fn collect_items_parallel<'tcx>(
     tcx: TyCtxt<'tcx>,
     roots: Vec<MonoItem<'tcx>>,
@@ -396,18 +421,41 @@ fn collect_items_parallel<'tcx>(
 ) {
     let roots: Vec<_> = {
         let mut visited = state.visited.lock();
-        roots
-            .into_iter()
-            .filter(|&root| visited.insert(root))
-            .map(|root| WalkItem {
-                item: dummy_spanned(root),
-                mode: CollectionMode::UsedItems,
-                recursion_depths: DefIdMap::default(),
-            })
-            .collect()
+        roots.into_iter().filter(|&root| visited.insert(root)).collect()
     };
+    let aborted: Vec<AtomicBool> = roots.iter().map(|_| AtomicBool::new(false)).collect();
+    let roots = roots
+        .into_iter()
+        .enumerate()
+        .map(|(root, item)| WalkItem {
+            item: dummy_spanned(item),
+            mode: CollectionMode::UsedItems,
+            root,
+            recursion_depths: DefIdMap::default(),
+        })
+        .collect();
+
+    /// Marks the root of the item being processed as abandoned if processing panics.
+    struct AbortRootOnPanic<'a>(&'a AtomicBool);
+    impl Drop for AbortRootOnPanic<'_> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
     par_work_queue(roots, |walk_item: WalkItem<'tcx>, next: &mut Vec<WalkItem<'tcx>>| {
-        let WalkItem { item, mode, mut recursion_depths } = walk_item;
+        let WalkItem { item, mode, root, mut recursion_depths } = walk_item;
+        let aborted = &aborted[root];
+        if aborted.load(Ordering::Relaxed) {
+            return;
+        }
+        let _abort_on_panic = AbortRootOnPanic(aborted);
+        if is_deep_recursion(tcx, &recursion_depths, recursion_limit) {
+            collect_items_rec(tcx, item, state, &mut recursion_depths, recursion_limit, mode);
+            return;
+        }
         let (used_items, mentioned_items, _) =
             collect_items_step(tcx, item, state, &mut recursion_depths, recursion_limit, mode);
         // Used items first, then mentioned items, as in the recursive walk.
@@ -415,6 +463,7 @@ fn collect_items_parallel<'tcx>(
             next.push(WalkItem {
                 item: used_item,
                 mode: CollectionMode::UsedItems,
+                root,
                 recursion_depths: recursion_depths.clone(),
             });
         }
@@ -422,6 +471,7 @@ fn collect_items_parallel<'tcx>(
             next.push(WalkItem {
                 item: mentioned_item,
                 mode: CollectionMode::MentionedItems,
+                root,
                 recursion_depths: recursion_depths.clone(),
             });
         }
@@ -2021,9 +2071,10 @@ pub(crate) fn collect_crate_mono_items<'tcx>(
         if is_dyn_thread_safe() {
             collect_items_parallel(tcx, roots, &state, recursion_limit);
         } else {
-            for root in roots {
-                collect_items_root(tcx, dummy_spanned(root), &state, recursion_limit);
-            }
+            // Like the parallel walk, a fatal error in one root's walk does not stop the others.
+            par_for_each_in(roots, |root| {
+                collect_items_root(tcx, dummy_spanned(*root), &state, recursion_limit);
+            });
         }
     });
 
