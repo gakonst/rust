@@ -211,7 +211,7 @@ use std::ops::ControlFlow;
 use rustc_attr_ir::InlineAttr;
 use rustc_attr_ir::lang_items::LangItem;
 use rustc_data_structures::fx::FxIndexMap;
-use rustc_data_structures::sync::{Lock, par_for_each_in};
+use rustc_data_structures::sync::{Lock, is_dyn_thread_safe, par_for_each_in};
 use rustc_data_structures::unord::{UnordMap, UnordSet};
 use rustc_hir as hir;
 use rustc_hir::def::DefKind;
@@ -352,6 +352,10 @@ impl<'tcx> Extend<Spanned<MonoItem<'tcx>>> for MonoItems<'tcx> {
     }
 }
 
+/// Up to which depth of the mono item graph walk [`collect_items_rec`] visits the items used by an
+/// item in parallel (with the parallel frontend).
+const PAR_COLLECT_MAX_DEPTH: usize = 32;
+
 fn collect_items_root<'tcx>(
     tcx: TyCtxt<'tcx>,
     starting_item: Spanned<MonoItem<'tcx>>,
@@ -370,6 +374,7 @@ fn collect_items_root<'tcx>(
         &mut recursion_depths,
         recursion_limit,
         CollectionMode::UsedItems,
+        0,
     );
 }
 
@@ -386,6 +391,7 @@ fn collect_items_rec<'tcx>(
     recursion_depths: &mut DefIdMap<usize>,
     recursion_limit: Limit,
     mode: CollectionMode,
+    depth: usize,
 ) {
     let mut used_items = MonoItems::new();
     let mut mentioned_items = MonoItems::new();
@@ -592,6 +598,27 @@ fn collect_items_rec<'tcx>(
     }
     if mode == CollectionMode::MentionedItems {
         assert!(used_items.is_empty(), "'mentioned' collection should never encounter used items");
+    } else if depth < PAR_COLLECT_MAX_DEPTH && used_items.items.len() > 1 && is_dyn_thread_safe() {
+        // With the parallel frontend, walk the newly discovered items in parallel. Collection
+        // starts from the roots in parallel already, but the bulk of a crate's mono items is often
+        // reachable from just a few roots, which would otherwise be walked by a single thread.
+        // Each walk gets its own copy of the recursion depths of the current path. Which thread
+        // visits an item first does not affect the collected items (the result is sorted).
+        // Parallelism is only introduced near the top of the walk to bound the extra stack usage
+        // of nested work-stealing waits.
+        let recursion_depths = &*recursion_depths;
+        par_for_each_in(used_items, |used_item| {
+            let mut recursion_depths = recursion_depths.clone();
+            collect_items_rec(
+                tcx,
+                *used_item,
+                state,
+                &mut recursion_depths,
+                recursion_limit,
+                CollectionMode::UsedItems,
+                depth + 1,
+            );
+        });
     } else {
         for used_item in used_items {
             collect_items_rec(
@@ -601,6 +628,7 @@ fn collect_items_rec<'tcx>(
                 recursion_depths,
                 recursion_limit,
                 CollectionMode::UsedItems,
+                depth + 1,
             );
         }
     }
@@ -615,6 +643,7 @@ fn collect_items_rec<'tcx>(
             recursion_depths,
             recursion_limit,
             CollectionMode::MentionedItems,
+            depth + 1,
         );
     }
 
