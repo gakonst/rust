@@ -247,6 +247,38 @@ impl SerializedDepGraph {
         map.get(&dep_node.key_fingerprint).copied()
     }
 
+    /// With multiple threads, builds the `key_fingerprint -> index` maps of the dep kinds with
+    /// many nodes in the background, largest first. In incremental rebuilds most of them are
+    /// needed later anyway, e.g. once mono item collection invokes queries by key, and building
+    /// one there blocks every thread that needs it. Single-threaded, all maps stay lazy.
+    pub fn prefetch_reverse_index(self: &Arc<Self>) {
+        if !rustc_data_structures::sync::is_dyn_thread_safe() {
+            return;
+        }
+        const MIN_NODES: u32 = 4096;
+        let mut kinds: Vec<(u32, usize)> = self
+            .reverse_index
+            .kinds
+            .iter()
+            .enumerate()
+            .filter(|(_, kind)| kind.len >= MIN_NODES)
+            .map(|(i, kind)| (kind.len, i))
+            .collect();
+        kinds.sort_unstable_by(|a, b| b.cmp(a));
+        for (_, i) in kinds {
+            let graph = Arc::clone(self);
+            rustc_data_structures::sync::spawn(move || {
+                let kind = DepKind::from_u16(i as u16);
+                let _ = graph.reverse_index.kinds[i].fingerprint_map(
+                    kind,
+                    &graph.nodes,
+                    &graph.reverse_index.nodes_by_kind,
+                    &graph.profiler,
+                );
+            });
+        }
+    }
+
     #[inline]
     pub fn value_fingerprint_for_index(
         &self,

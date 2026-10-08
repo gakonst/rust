@@ -107,6 +107,7 @@ fn load_dep_graph(sess: &Session, incr_comp_session: &IncrCompSession) -> LoadRe
             }
 
             let prev_graph = SerializedDepGraph::decode(&mut decoder, &sess.prof);
+            prev_graph.prefetch_reverse_index();
 
             LoadResult::Ok { prev_graph, prev_work_products }
         }
