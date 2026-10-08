@@ -851,9 +851,7 @@ pub fn codegen_crate<
         ongoing_codegen.wait_for_signal_to_codegen_item();
         ongoing_codegen.check_for_errors(tcx.sess);
 
-        let cgu_reuse = cgu_reuse[i];
-
-        match cgu_reuse {
+        match cgu_reuse[i] {
             CguReuse::No => {
                 // With the parallel frontend, the main thread would otherwise translate the
                 // remaining CGUs to LLVM IR one at a time, which often leaves the LLVM workers
