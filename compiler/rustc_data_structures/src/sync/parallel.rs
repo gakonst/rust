@@ -3,7 +3,6 @@
 
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 
@@ -17,15 +16,12 @@ use crate::sync::{DynSend, DynSync, FromDyn, IntoDynSyncSend, mode};
 /// output match the parallel compiler for testing purposes.
 pub struct ParallelGuard {
     panic: Mutex<Option<IntoDynSyncSend<Box<dyn Any + Send + 'static>>>>,
-    /// Whether any closure run by this guard has panicked so far.
-    panicked: AtomicBool,
 }
 
 impl ParallelGuard {
     pub fn run<R>(&self, f: impl FnOnce() -> R) -> Option<R> {
         catch_unwind(AssertUnwindSafe(f))
             .map_err(|err| {
-                self.panicked.store(true, Ordering::Relaxed);
                 let mut panic = self.panic.lock();
                 if panic.is_none() || !(*err).is::<FatalErrorMarker>() {
                     *panic = Some(IntoDynSyncSend(err));
@@ -33,19 +29,13 @@ impl ParallelGuard {
             })
             .ok()
     }
-
-    /// Whether a closure run by this guard has panicked (e.g. with a fatal error), in which case
-    /// the panic will be resumed when the parallel section ends.
-    pub fn panicked(&self) -> bool {
-        self.panicked.load(Ordering::Relaxed)
-    }
 }
 
 /// This gives access to a fresh parallel guard in the closure and will unwind any panics
 /// caught in it after the closure returns.
 #[inline]
 pub fn parallel_guard<R>(f: impl FnOnce(&ParallelGuard) -> R) -> R {
-    let guard = ParallelGuard { panic: Mutex::new(None), panicked: AtomicBool::new(false) };
+    let guard = ParallelGuard { panic: Mutex::new(None) };
     let ret = f(&guard);
     if let Some(IntoDynSyncSend(panic)) = guard.panic.into_inner() {
         resume_unwind(panic);
@@ -242,8 +232,8 @@ pub fn par_for_each_in_order<I: DynSync>(items: &[I], for_each: impl Fn(&I) + Dy
 /// (unlike recursive `par_for_each_in` calls, whose blocking waits nest). The thread that
 /// discovered follow-up items continues with the first one itself. Without the parallel frontend,
 /// items are processed depth-first: all follow-ups of an item (and theirs) before its next sibling.
-/// Once processing an item panicked (e.g. with a fatal error), no further items are processed;
-/// the panic is resumed at the end.
+/// A panic while processing an item (e.g. a fatal error) does not stop the processing of other
+/// items (`process` may check its own state to skip work); the panic is resumed at the end.
 pub fn par_work_queue<T: DynSend>(roots: Vec<T>, process: impl Fn(T, &mut Vec<T>) + DynSync + DynSend) {
     parallel_guard(|guard| {
         if let Some(proof) = mode::check_dyn_thread_safe() {
@@ -259,9 +249,6 @@ pub fn par_work_queue<T: DynSend>(roots: Vec<T>, process: impl Fn(T, &mut Vec<T>
             stack.reverse();
             let mut next = Vec::new();
             while let Some(item) = stack.pop() {
-                if guard.panicked() {
-                    break;
-                }
                 guard.run(|| process(item, &mut next));
                 stack.extend(next.drain(..).rev());
             }
@@ -279,14 +266,8 @@ fn work_queue_spawn<'s, T: DynSend + 's, F: Fn(T, &mut Vec<T>) + DynSync + DynSe
         let mut item = item;
         let mut next = Vec::new();
         loop {
-            // Once an item panicked (e.g. a fatal recursion limit error), the section unwinds when
-            // it ends; stop processing further items, which could otherwise be an unbounded
-            // amount of work (a serial walk would have stopped at the first fatal error).
-            if guard.panicked() {
-                break;
-            }
             guard.run(|| (**process)(item.into_inner(), &mut next));
-            if next.is_empty() || guard.panicked() {
+            if next.is_empty() {
                 break;
             }
             let mut rest = next.drain(..);
