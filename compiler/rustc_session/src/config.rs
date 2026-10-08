@@ -1758,7 +1758,7 @@ fn parse_jobs_all(
                 check_upper_limit(frontend, opt_name);
                 frontend
             }
-            None => None, // default to 1 thread irrespectively of `jobs` for now
+            None => default_jobs_frontend(jobs, &mut available),
         },
     };
     let backend = match matches.opt_str("jobs-backend") {
@@ -1790,6 +1790,45 @@ fn parse_jobs_all(
     };
 
     Jobs { frontend, backend, linker }
+}
+
+/// Upper bound for the number of frontend threads picked automatically. The parallel frontend
+/// scales well up to about this many threads; beyond that, contention outweighs the gains.
+const DEFAULT_MAX_JOBS_FRONTEND: u8 = 8;
+
+/// The number of frontend threads used when neither `--jobs-frontend` nor `-Zthreads` is passed.
+///
+/// When rustc is driven by Cargo, it inherits Cargo's jobserver. The frontend thread pool only
+/// runs work on extra threads after acquiring jobserver tokens for them, so using several threads
+/// cannot oversubscribe the machine: if Cargo runs many rustc processes in parallel, each gets
+/// one thread; when few crates can be built in parallel (e.g. at the end of a build, which is
+/// typically dominated by one large crate), the spare tokens let that crate use more cores.
+/// Compilation results do not depend on the number of threads.
+///
+/// Outside of Cargo (e.g. direct invocations, the compiler test suites) rustc keeps using a single
+/// thread by default.
+fn default_jobs_frontend(
+    jobs: Option<Option<NonZero<usize>>>,
+    available: &mut Option<u8>,
+) -> Option<NonZero<usize>> {
+    let driven_by_cargo_jobserver = std::env::var_os("CARGO_MAKEFLAGS").is_some_and(|flags| {
+        let flags = flags.to_string_lossy();
+        flags.contains("--jobserver-auth=") || flags.contains("--jobserver-fds=")
+    });
+    if !driven_by_cargo_jobserver {
+        return None;
+    }
+    let available = *available.get_or_insert_with(|| match thread::available_parallelism() {
+        Ok(n) => u8::try_from(n.get()).unwrap_or(u8::MAX),
+        Err(_) => 1,
+    });
+    let mut n = available.min(DEFAULT_MAX_JOBS_FRONTEND);
+    // Respect an explicit overall `--jobs` limit.
+    if let Some(jobs) = jobs {
+        let jobs = jobs.map_or(1, |j| u8::try_from(j.get()).unwrap_or(u8::MAX));
+        n = n.min(jobs);
+    }
+    (n > 1).then_some(NonZero::new(usize::from(n)).unwrap())
 }
 
 // Parse a string passed to one of the `--jobs` options or `-Zthreads`.
