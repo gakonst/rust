@@ -2674,6 +2674,9 @@ options! {
          revert to computing it from the HIR (default: yes)"),
     metrics_dir: Option<PathBuf> = (None, parse_opt_pathbuf, [UNTRACKED],
         "the directory metrics emitted by rustc are dumped into (implicitly enables default set of metrics)"),
+    min_cgu_size: Option<usize> = (None, parse_opt_number, [TRACKED],
+        "in non-incremental builds, merge codegen units smaller than this size estimate even \
+        when the number of codegen units was given explicitly (default: only for a default count)"),
     min_function_alignment: Option<Align> = (None, parse_align, [TRACKED],
         "align all functions to at least this many bytes. Must be a power of 2"),
     min_recursion_limit: Option<usize> = (None, parse_opt_number, [TRACKED],
