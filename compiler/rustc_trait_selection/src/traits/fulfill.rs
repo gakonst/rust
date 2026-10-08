@@ -901,9 +901,7 @@ impl<'a, 'tcx> FulfillProcessor<'a, 'tcx> {
             if pred.has_non_region_infer() || pred.has_placeholders() || pred.has_param() {
                 return None;
             }
-            // On overflow, fall back to processing the obligation via selection (as without
-            // this fast path), so that the same obligation is reported as overflowing.
-            let result = infcx.evaluate_obligation(obligation).ok()?;
+            let result = infcx.evaluate_obligation_no_overflow(obligation);
             result.must_apply_modulo_regions().then_some(result)
         } else {
             if !pred.is_global() {
