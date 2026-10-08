@@ -263,8 +263,18 @@ where
         // going via another root item. This includes drop-glue, functions from
         // external crates, and local functions the definition of which is
         // marked with `#[inline]`.
+        //
+        // Items that are already in this CGU as inlined items are skipped without visiting what
+        // they use: everything reachable from them was added together with them. This does not
+        // change which items get added, nor their order.
         let mut reachable_inlined_items = FxIndexSet::default();
-        get_reachable_inlined_items(cx.tcx, mono_item, cx.usage_map, &mut reachable_inlined_items);
+        get_reachable_inlined_items(
+            cx.tcx,
+            mono_item,
+            cx.usage_map,
+            cgu.items(),
+            &mut reachable_inlined_items,
+        );
 
         // Add those inlined items. It's possible an inlined item is reachable
         // from multiple root items within a CGU, which is fine, it just means
@@ -301,12 +311,18 @@ where
         tcx: TyCtxt<'tcx>,
         item: MonoItem<'tcx>,
         usage_map: &UsageMap<'tcx>,
+        already_placed: &FxIndexMap<MonoItem<'tcx>, MonoItemData>,
         visited: &mut FxIndexSet<MonoItem<'tcx>>,
     ) {
         usage_map.for_each_inlined_used_item(tcx, item, |inlined_item| {
+            // Only inlined items are yielded here, and those are only ever placed into a CGU
+            // together with everything they (transitively) use, see above.
+            if already_placed.contains_key(&inlined_item) {
+                return;
+            }
             let is_new = visited.insert(inlined_item);
             if is_new {
-                get_reachable_inlined_items(tcx, inlined_item, usage_map, visited);
+                get_reachable_inlined_items(tcx, inlined_item, usage_map, already_placed, visited);
             }
         });
     }
