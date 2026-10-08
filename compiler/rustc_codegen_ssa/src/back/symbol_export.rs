@@ -314,6 +314,13 @@ fn exported_generic_symbols_provider_local<'tcx>(
         .iter()
         .any(|o| matches!(o, rustc_session::config::Offload::Device(_)));
 
+    // Without share-generics, only instantiations of `#[inline(never)]` generic functions are
+    // exported. If that is disabled too, there is nothing to export and, importantly, no need to
+    // collect and partition mono items here: this query is used by metadata encoding, so that
+    // would delay the `.rmeta` (and hence pipelined downstream crates) until mono collection
+    // and partitioning are done.
+    let export_generics = export_generics
+        && (tcx.sess.opts.share_generics() || tcx.sess.opts.share_inline_never_generics());
     if export_generics || is_device_offload {
         use rustc_attr_ir::{InlineAttr, Linkage};
         use rustc_middle::mono::{MonoItem, Visibility};

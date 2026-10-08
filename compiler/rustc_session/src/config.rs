@@ -1557,6 +1557,13 @@ impl Options {
         }
     }
 
+    /// Whether instantiations of `#[inline(never)]` generic functions are made available to
+    /// downstream crates even if `share_generics()` is off.
+    #[inline]
+    pub fn share_inline_never_generics(&self) -> bool {
+        self.unstable_opts.share_inline_never_generics.unwrap_or(true)
+    }
+
     pub fn get_symbol_mangling_version(&self) -> SymbolManglingVersion {
         self.cg.symbol_mangling_version.unwrap_or(SymbolManglingVersion::V0)
     }
