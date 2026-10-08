@@ -67,9 +67,7 @@ where
         && let Some(error_info) = error_info
     {
         let universe_info = error_info.to_universe_info(old_universe);
-        for u in (old_universe + 1)..=universe {
-            constraints.universe_causes.insert(u, universe_info.clone());
-        }
+        constraints.universe_causes.insert_range(old_universe + 1, universe, universe_info);
     }
 
     Ok(output)

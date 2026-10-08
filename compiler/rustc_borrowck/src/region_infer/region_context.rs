@@ -3,7 +3,7 @@ use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 
 use rustc_data_structures::frozen::Frozen;
-use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
+use rustc_data_structures::fx::FxIndexSet;
 use rustc_errors::Diag;
 use rustc_index::IndexVec;
 use rustc_infer::infer::outlives::test_type_match;
@@ -23,7 +23,7 @@ use crate::constraints::graph::NormalConstraintGraph;
 use crate::constraints::{ConstraintSccIndex, OutlivesConstraint, OutlivesConstraintSet};
 use crate::consumers::PoloniusOutput;
 use crate::dataflow::BorrowIndex;
-use crate::diagnostics::{RegionErrorKind, RegionErrors, UniverseInfo};
+use crate::diagnostics::{RegionErrorKind, RegionErrors, UniverseCauses, UniverseInfo};
 use crate::handle_placeholders::{LoweredConstraints, RegionTracker};
 use crate::region_infer::values::{LivenessValues, RegionElement, RegionValues};
 use crate::region_infer::{
@@ -68,7 +68,7 @@ pub struct RegionInferenceContextInner<'tcx> {
     scc_annotations: IndexVec<ConstraintSccIndex, RegionTracker>,
 
     /// Map universe indexes to information on why we created it.
-    universe_causes: FxIndexMap<ty::UniverseIndex, UniverseInfo<'tcx>>,
+    universe_causes: UniverseCauses<'tcx>,
 
     /// The final inferred values of the region variables; we compute
     /// one value per SCC. To get the value for any given *region*,
@@ -807,7 +807,7 @@ impl<'tcx> RegionInferenceContextInner<'tcx> {
         // #114907 where this happens via liveness and dropck outlives results.
         // Therefore, we return a default value in case that happens, which should at worst emit a
         // suboptimal error, instead of the ICE.
-        self.universe_causes.get(&universe).cloned().unwrap_or_else(UniverseInfo::other)
+        self.universe_causes.get(universe).cloned().unwrap_or_else(UniverseInfo::other)
     }
 
     /// Tries to find the terminator of the loop in which the region 'r' resides.
