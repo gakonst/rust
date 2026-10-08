@@ -20,6 +20,7 @@ use rustc_attr_ir::find_attr;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::indexmap::IndexSet;
 use rustc_data_structures::intern::Interned;
+use rustc_data_structures::sync;
 use rustc_errors::{MultiSpan, listify};
 use rustc_hir::def::{CtorOf, DefKind, Res};
 use rustc_hir::def_id::{DefId, LocalDefId, LocalModId};
@@ -1790,40 +1791,57 @@ fn effective_visibilities(tcx: TyCtxt<'_>, (): ()) -> &EffectiveVisibilities {
         // Underlying types of `impl Trait`s are marked as reachable unconditionally,
         // so this pass doesn't need to be a part of the fixed point iteration below.
         let krate = tcx.hir_crate_items(());
-        for id in krate.opaques() {
-            let opaque = tcx.hir_node_by_def_id(id).expect_opaque_ty();
-            let should_visit = match opaque.origin {
-                hir::OpaqueTyOrigin::FnReturn {
-                    parent,
-                    in_trait_or_impl: Some(hir::RpitContext::Trait),
-                }
-                | hir::OpaqueTyOrigin::AsyncFn {
-                    parent,
-                    in_trait_or_impl: Some(hir::RpitContext::Trait),
-                } => match tcx.hir_node_by_def_id(parent).expect_trait_item().expect_fn().1 {
-                    hir::TraitFn::Required(_) => false,
-                    hir::TraitFn::Provided(..) => true,
-                },
+        let opaques_to_visit: Vec<LocalDefId> = krate
+            .opaques()
+            .filter(|&id| {
+                let opaque = tcx.hir_node_by_def_id(id).expect_opaque_ty();
+                match opaque.origin {
+                    hir::OpaqueTyOrigin::FnReturn {
+                        parent,
+                        in_trait_or_impl: Some(hir::RpitContext::Trait),
+                    }
+                    | hir::OpaqueTyOrigin::AsyncFn {
+                        parent,
+                        in_trait_or_impl: Some(hir::RpitContext::Trait),
+                    } => match tcx.hir_node_by_def_id(parent).expect_trait_item().expect_fn().1 {
+                        hir::TraitFn::Required(_) => false,
+                        hir::TraitFn::Provided(..) => true,
+                    },
 
-                // Always visit RPITs in functions that have definitions,
-                // and all TAITs.
-                hir::OpaqueTyOrigin::FnReturn {
-                    in_trait_or_impl: None | Some(hir::RpitContext::TraitImpl),
-                    ..
+                    // Always visit RPITs in functions that have definitions,
+                    // and all TAITs.
+                    hir::OpaqueTyOrigin::FnReturn {
+                        in_trait_or_impl: None | Some(hir::RpitContext::TraitImpl),
+                        ..
+                    }
+                    | hir::OpaqueTyOrigin::AsyncFn {
+                        in_trait_or_impl: None | Some(hir::RpitContext::TraitImpl),
+                        ..
+                    }
+                    | hir::OpaqueTyOrigin::TyAlias { .. } => true,
                 }
-                | hir::OpaqueTyOrigin::AsyncFn {
-                    in_trait_or_impl: None | Some(hir::RpitContext::TraitImpl),
-                    ..
-                }
-                | hir::OpaqueTyOrigin::TyAlias { .. } => true,
-            };
-            if should_visit {
-                // FIXME: This is some serious pessimization intended to workaround deficiencies
-                // in the reachability pass (`middle/reachable.rs`). Types are marked as link-time
-                // reachable if they are returned via `impl Trait`, even from private functions.
-                let pub_ev = EffectiveVisibility::from_vis(ty::Visibility::Public);
-                visitor.reach_through_impl_trait(opaque.def_id, pub_ev).generics().clauses().ty();
-            }
+            })
+            .collect();
+
+        // Computing the hidden type of an opaque type requires borrow-checking its defining
+        // body. In crates with many `async fn`s this makes up most of the work of this query
+        // (and transitively of whole-crate checking), yet the walk below is sequential.
+        // When the parallel frontend is enabled, compute the hidden types in parallel up
+        // front, so that the sequential walk only hits the query cache. With a single thread
+        // nothing changes, which keeps diagnostic order deterministic.
+        if sync::is_dyn_thread_safe() {
+            sync::par_for_each_in(&opaques_to_visit, |&&id| {
+                tcx.ensure_ok().type_of(id);
+            });
+        }
+
+        for id in opaques_to_visit {
+            let opaque = tcx.hir_node_by_def_id(id).expect_opaque_ty();
+            // FIXME: This is some serious pessimization intended to workaround deficiencies
+            // in the reachability pass (`middle/reachable.rs`). Types are marked as link-time
+            // reachable if they are returned via `impl Trait`, even from private functions.
+            let pub_ev = EffectiveVisibility::from_vis(ty::Visibility::Public);
+            visitor.reach_through_impl_trait(opaque.def_id, pub_ev).generics().clauses().ty();
         }
 
         visitor.queue.clear();
