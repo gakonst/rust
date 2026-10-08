@@ -848,6 +848,7 @@ fn test_unstable_options_tracking_hash() {
     tracked!(location_detail, LocationDetail { file: true, line: false, column: false });
     tracked!(maximal_hir_to_mir_coverage, true);
     tracked!(merge_functions, Some(MergeFunctions::Disabled));
+    tracked!(min_cgu_size, Some(1800));
     tracked!(min_function_alignment, Some(Align::EIGHT));
     tracked!(min_recursion_limit, Some(256));
     tracked!(mir_enable_passes, vec![("DestProp".to_string(), false)]);

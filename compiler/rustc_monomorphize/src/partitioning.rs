@@ -387,6 +387,15 @@ fn merge_codegen_units<'tcx>(
     // there is just one CGU, of course). Note that CGU sizes of 100,000+ are
     // common in larger programs, so this isn't all that large.
     const NON_INCR_MIN_CGU_SIZE: usize = 1800;
+    // `-Zmin-cgu-size` applies the same merging (with the given threshold) even when the CGU
+    // count was given explicitly, which `-Ccodegen-units` documents as a *maximum*.
+    let min_cgu_size = match cx.tcx.sess.opts.unstable_opts.min_cgu_size {
+        Some(n) => Some(n),
+        None if matches!(cx.tcx.sess.codegen_units(), CodegenUnits::Default(_)) => {
+            Some(NON_INCR_MIN_CGU_SIZE)
+        }
+        None => None,
+    };
 
     // Repeatedly merge the two smallest codegen units as long as: it's a
     // non-incremental build, and the user didn't specify a CGU count, and
@@ -398,9 +407,9 @@ fn merge_codegen_units<'tcx>(
     // critical they aren't merged. Also, some tests use explicit small values
     // and likewise won't work if small CGUs are merged.
     while cx.tcx.sess.opts.incremental.is_none()
-        && matches!(cx.tcx.sess.codegen_units(), CodegenUnits::Default(_))
+        && let Some(min_cgu_size) = min_cgu_size
         && codegen_units.len() > 1
-        && codegen_units.iter().any(|cgu| cgu.size_estimate() < NON_INCR_MIN_CGU_SIZE)
+        && codegen_units.iter().any(|cgu| cgu.size_estimate() < min_cgu_size)
     {
         // Sort small cgus to the back.
         codegen_units.sort_by_key(|cgu| cmp::Reverse(cgu.size_estimate()));
