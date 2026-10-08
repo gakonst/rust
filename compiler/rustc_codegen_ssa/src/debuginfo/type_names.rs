@@ -14,7 +14,7 @@
 use std::fmt::Write;
 
 use rustc_abi::Integer;
-use rustc_data_structures::fx::FxHashSet;
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::stable_hash::{StableHash, StableHasher};
 use rustc_hashes::Hash64;
 use rustc_hir::def_id::DefId;
@@ -652,6 +652,51 @@ pub fn push_generic_args<'tcx>(tcx: TyCtxt<'tcx>, args: GenericArgsRef<'tcx>, ou
     let _prof = tcx.prof.generic_activity("compute_debuginfo_type_name");
     let mut visited = FxHashSet::default();
     push_generic_args_internal(tcx, args, output, &mut visited);
+}
+
+/// Like [`push_generic_args`], but memoizes the name of every top-level generic type argument in
+/// `cache`, so that the (often very large) names of types that occur in the generic arguments of
+/// many instances are only computed once per cache.
+///
+/// This produces exactly the same output as [`push_generic_args`]: the `visited` set used by
+/// `push_debuginfo_type_name` only holds the fn-pointer types that are currently being printed
+/// (to detect recursive fn-pointer types) and is empty again after each top-level argument, so
+/// the name of a top-level argument does not depend on its context.
+pub fn push_generic_args_cached<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    args: GenericArgsRef<'tcx>,
+    output: &mut String,
+    cache: &mut FxHashMap<Ty<'tcx>, String>,
+) {
+    let _prof = tcx.prof.generic_activity("compute_debuginfo_type_name");
+    tcx.assert_fully_normalized(ty::TypingEnv::fully_monomorphized(), args);
+    let mut args = args.non_erasable_generics().peekable();
+    if args.peek().is_none() {
+        return;
+    }
+    let cpp_like_debuginfo = cpp_like_debuginfo(tcx);
+
+    output.push('<');
+
+    for arg in args {
+        match arg {
+            GenericArgKind::Type(ty) => {
+                let name = cache.entry(ty).or_insert_with(|| {
+                    let mut name = String::new();
+                    let mut visited = FxHashSet::default();
+                    push_debuginfo_type_name(tcx, ty, true, &mut name, &mut visited);
+                    name
+                });
+                output.push_str(name);
+            }
+            GenericArgKind::Const(ct) => push_debuginfo_const_name(tcx, ct, output),
+            other => bug!("Unexpected non-erasable generic: {:?}", other),
+        }
+
+        push_arg_separator(cpp_like_debuginfo, output);
+    }
+    pop_arg_separator(output);
+    push_close_angle_bracket(cpp_like_debuginfo, output);
 }
 
 fn push_generic_args_internal<'tcx>(
