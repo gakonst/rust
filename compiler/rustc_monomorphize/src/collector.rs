@@ -354,7 +354,18 @@ impl<'tcx> Extend<Spanned<MonoItem<'tcx>>> for MonoItems<'tcx> {
 
 /// Up to which depth of the mono item graph walk [`collect_items_rec`] visits the items used by an
 /// item in parallel (with the parallel frontend).
-const PAR_COLLECT_MAX_DEPTH: usize = 32;
+const PAR_COLLECT_MAX_DEPTH_DEFAULT: usize = 32;
+
+// EXPERIMENT ONLY (exp-i): tunable via RUSTC_EXP_PAR_COLLECT_DEPTH.
+fn par_collect_max_depth() -> usize {
+    static D: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *D.get_or_init(|| {
+        std::env::var("RUSTC_EXP_PAR_COLLECT_DEPTH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(PAR_COLLECT_MAX_DEPTH_DEFAULT)
+    })
+}
 
 fn collect_items_root<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -598,7 +609,7 @@ fn collect_items_rec<'tcx>(
     }
     if mode == CollectionMode::MentionedItems {
         assert!(used_items.is_empty(), "'mentioned' collection should never encounter used items");
-    } else if depth < PAR_COLLECT_MAX_DEPTH && used_items.items.len() > 1 && is_dyn_thread_safe() {
+    } else if depth < par_collect_max_depth() && used_items.items.len() > 1 && is_dyn_thread_safe() {
         // With the parallel frontend, walk the newly discovered items in parallel. Collection
         // starts from the roots in parallel already, but the bulk of a crate's mono items is often
         // reachable from just a few roots, which would otherwise be walked by a single thread.
